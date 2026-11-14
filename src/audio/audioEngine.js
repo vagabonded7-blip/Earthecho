@@ -1,5 +1,7 @@
 import { mapBrightnessToSound, mapScalarToSound } from './mapping.js';
 
+import { prepareComparisonPlayback } from './comparison.js';
+
 const MAX_VOICES = 8;
 const MAX_COMBINED_VOICE_GAIN = 0.8;
 const DEFAULT_MASTER_VOLUME = 0.7;
@@ -650,6 +652,37 @@ export async function playGrid(dataset, frameIndex = 0, timing) {
   const prepared = prepareGridPlayback(dataset, frameIndex, timing);
   return startPlayback(prepared.events, prepared.timelineDurationSeconds);
 }
+
+/**
+ * Plays the signed differences between two compatible datasets.
+ *
+ * Positive changes use the upper musical register.
+ * Negative changes use the lower musical register.
+ *
+ * Call initAudio() from a user interaction before calling this function.
+ *
+ * @param {object} dataset2012 - Baseline dataset.
+ * @param {object} dataset2023 - Comparison dataset.
+ * @param {object} options - Comparison sonification options.
+ * @returns {Promise<void>}
+ */
+export async function playComparison(
+  dataset2012,
+  dataset2023,
+  options = {}
+) {
+  const prepared = prepareComparisonPlayback(
+    dataset2012,
+    dataset2023,
+    options
+  );
+
+  return startPlayback(
+    prepared.events,
+    prepared.timelineDurationSeconds
+  );
+}
+
 
 /**
  * Scans one selected frame in left-to-right column order.

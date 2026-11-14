@@ -11,8 +11,10 @@ async function loadEngine({ exposePrivateScheduler = false } = {}) {
     const declaration = 'function scheduleTone(';
     assert.ok(source.includes(declaration), 'Private scheduler declaration was not found.');
     const mappingUrl = new URL('../src/audio/mapping.js', import.meta.url).href;
+    const comparisonUrl = new URL('../src/audio/comparison.js', import.meta.url).href;
     const instrumentedSource = source
       .replace("from './mapping.js';", `from '${mappingUrl}';`)
+      .replace("from './comparison.js';", `from '${comparisonUrl}';`)
       .replace(declaration, 'export function scheduleTone(');
     const moduleUrl = `data:text/javascript,${encodeURIComponent(instrumentedSource)}#test=${moduleSequence}`;
     return import(moduleUrl);
