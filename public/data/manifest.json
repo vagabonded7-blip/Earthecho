@@ -6,6 +6,12 @@
       "path": "/data/night_lights_2012_2023.json",
       "label": "NASA Night Lights 2012-2023",
       "comparison_group": "night_lights"
+    },
+    {
+      "id": "ocean_ecco2_2007_2008",
+      "path": "/data/ocean_ecco2_2007_2008.json",
+      "label": "NASA ECCO2 Ocean Color Visualization 2007-2008",
+      "comparison_group": "ocean_ecco2"
     }
   ]
 }
