@@ -1,3 +1,4 @@
 /raw_data/
 __pycache__/
-*.pyc
+*.pycnode_modules/
+scripts/*.backup.py
