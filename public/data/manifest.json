@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "datasets": [
+    {
+      "id": "night_lights_2012",
+      "path": "/data/night_lights_2012.json",
+      "label": "Night Lights 2012",
+      "comparison_group": "night_lights"
+    },
+    {
+      "id": "night_lights_2023",
+      "path": "/data/night_lights_2023.json",
+      "label": "Night Lights 2023",
+      "comparison_group": "night_lights"
+    }
+  ]
+}
+
