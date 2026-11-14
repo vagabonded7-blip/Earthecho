@@ -9,6 +9,7 @@ import {
   stopAudio,
   setMasterVolume
 } from '../audio/audioEngine.js';
+import EarthMap from './EarthMap.jsx';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -59,158 +60,9 @@ function getActiveMatrix(dataset, frameIndex) {
   return frame.values[channelId] || null;
 }
 
-// ─── Interactive Grid Explorer ──────────────────────────────────────────────
-
-function GridExplorer({ dataset, frameIndex }) {
-  const canvasRef = useRef(null);
-  const [selectedCell, setSelectedCell] = useState(null);
-  const [focusedCoord, setFocusedCoord] = useState({ x: 0, y: 0 });
-  const matrix = getActiveMatrix(dataset, frameIndex);
-
-  const width = dataset?.width || 64;
-  const height = dataset?.height || 32;
-
-  // Determine color scheme based on dataset category
-  const isOcean = dataset?.id?.includes('ocean') || dataset?.id?.includes('sea');
-  const isVegetation = dataset?.id?.includes('vegetation') || dataset?.id?.includes('forest') || dataset?.id?.includes('ndvi');
-
-  const drawGrid = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !matrix) return;
-    const ctx = canvas.getContext('2d');
-    const cw = canvas.width / width;
-    const ch = canvas.height / height;
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const val = matrix[y]?.[x];
-        if (val === null || val === undefined) {
-          ctx.fillStyle = '#06100e';
-        } else {
-          const intensity = Math.max(0, Math.min(1, val));
-          if (isOcean) {
-            const r = Math.round(15 + intensity * 60);
-            const g = Math.round(50 + intensity * 180);
-            const b = Math.round(120 + intensity * 135);
-            ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
-          } else if (isVegetation) {
-            const r = Math.round(20 + (1 - intensity) * 80);
-            const g = Math.round(60 + intensity * 190);
-            const b = Math.round(30 + intensity * 80);
-            ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
-          } else {
-            // Night Lights (warm gold/amber glow)
-            const r = Math.round(intensity * 255);
-            const g = Math.round(intensity * 215);
-            const b = Math.round(intensity * 120);
-            ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
-          }
-        }
-        ctx.fillRect(x * cw, y * ch, cw, ch);
-      }
-    }
-
-    // Highlight hovered/focused cell
-    if (focusedCoord) {
-      ctx.strokeStyle = '#9cdbbd';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(focusedCoord.x * cw, focusedCoord.y * ch, cw, ch);
-    }
-  }, [matrix, width, height, isOcean, isVegetation, focusedCoord]);
-
-  useEffect(() => {
-    drawGrid();
-  }, [drawGrid]);
-
-  const triggerCell = useCallback(async (x, y) => {
-    setFocusedCoord({ x, y });
-    const val = matrix?.[y]?.[x];
-    if (val === null || val === undefined) {
-      setSelectedCell({ x, y, value: null, note: 'Silence (masked cell)' });
-      return;
-    }
-    try {
-      const tone = await playCell(dataset, frameIndex, x, y);
-      setSelectedCell({
-        x,
-        y,
-        value: val,
-        note: tone ? `${tone.frequencyHz.toFixed(1)} Hz (MIDI ${tone.midi})` : 'Silence'
-      });
-    } catch {
-      // ignore
-    }
-  }, [dataset, frameIndex, matrix]);
-
-  const handleCanvasClick = (e) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-    const clickX = (e.clientX - rect.left) * scaleX;
-    const clickY = (e.clientY - rect.top) * scaleY;
-    const cellX = Math.floor(clickX / (canvas.width / width));
-    const cellY = Math.floor(clickY / (canvas.height / height));
-    const clampedX = Math.max(0, Math.min(width - 1, cellX));
-    const clampedY = Math.max(0, Math.min(height - 1, cellY));
-    triggerCell(clampedX, clampedY);
-  };
-
-  const handleKeyDown = (e) => {
-    let { x, y } = focusedCoord;
-    if (e.key === 'ArrowRight') { x = Math.min(width - 1, x + 1); e.preventDefault(); }
-    else if (e.key === 'ArrowLeft') { x = Math.max(0, x - 1); e.preventDefault(); }
-    else if (e.key === 'ArrowDown') { y = Math.min(height - 1, y + 1); e.preventDefault(); }
-    else if (e.key === 'ArrowUp') { y = Math.max(0, y - 1); e.preventDefault(); }
-    else if (e.key === 'Enter' || e.key === ' ') { triggerCell(x, y); e.preventDefault(); return; }
-    else return;
-
-    setFocusedCoord({ x, y });
-    triggerCell(x, y);
-  };
-
-  return (
-    <section className="grid-explorer-panel" aria-label="Interactive Earth Grid Explorer">
-      <div className="explorer-header">
-        <h4>Explore Grid Cells</h4>
-        <span className="explorer-instructions">
-          Click or use arrow keys + space to probe individual grid points
-        </span>
-      </div>
-
-      <div className="canvas-wrapper">
-        <canvas
-          ref={canvasRef}
-          width={512}
-          height={256}
-          className="grid-canvas"
-          onClick={handleCanvasClick}
-          onKeyDown={handleKeyDown}
-          tabIndex={0}
-          role="application"
-          aria-label={`Interactive ${width} by ${height} data grid. Focus and use arrow keys to explore coordinates.`}
-        />
-      </div>
-
-      <div className="cell-probe-readout" aria-live="polite">
-        {selectedCell ? (
-          <span>
-            <strong>Cell ({selectedCell.x}, {selectedCell.y})</strong> · Value: {selectedCell.value !== null ? selectedCell.value.toFixed(4) : 'Null'} · Pitch: {selectedCell.note}
-          </span>
-        ) : (
-          <span className="text-muted">Probe any coordinate to hear its sonified pitch.</span>
-        )}
-      </div>
-    </section>
-  );
-}
-
 // ─── PlaybackControls ────────────────────────────────────────────────────────
 
-function PlaybackControls({ dataset, frameIndex }) {
+function PlaybackControls({ dataset, frameIndex, onPlayback }) {
   const [mode, setMode] = useState(null); // 'listen' | 'scan' | 'timelapse' | 'compare'
   const [audioError, setAudioError] = useState('');
   const [volume, setVolume] = useState(0.7);
@@ -238,6 +90,7 @@ function PlaybackControls({ dataset, frameIndex }) {
   const handleStop = useCallback(() => {
     stopAudio();
     setMode(null);
+    onPlayback?.(null);
   }, []);
 
   const startMode = useCallback(async (newMode) => {
@@ -257,6 +110,7 @@ function PlaybackControls({ dataset, frameIndex }) {
     }
 
     setMode(newMode);
+    onPlayback?.(newMode === 'listen' ? { start: performance.now(), duration: 14 } : null);
     try {
       let promise;
       if (newMode === 'listen') {
@@ -282,6 +136,7 @@ function PlaybackControls({ dataset, frameIndex }) {
         setAudioError(`Playback error: ${err.message}`);
       }
     } finally {
+      onPlayback?.(null);
       setMode(null);
       playPromise.current = null;
     }
@@ -507,6 +362,7 @@ export default function Jukebox({
   onRetry
 }) {
   const [frameIndex, setFrameIndex] = useState(0);
+  const [playback, setPlayback] = useState(null);
 
   useEffect(() => setFrameIndex(0), [selectedId]);
 
@@ -584,6 +440,8 @@ export default function Jukebox({
 
         {dataStatus === 'ready' && dataset && (
           <>
+            <div className="workspace">
+          <div className="workspace-side">
             <DatasetCard
               dataset={dataset}
               frameIndex={frameIndex}
@@ -593,12 +451,15 @@ export default function Jukebox({
             <PlaybackControls
               dataset={dataset}
               frameIndex={frameIndex}
+              onPlayback={setPlayback}
             />
-
-            <GridExplorer
+          </div>
+          <EarthMap
               dataset={dataset}
               frameIndex={frameIndex}
+              playback={playback}
             />
+          </div>
           </>
         )}
 

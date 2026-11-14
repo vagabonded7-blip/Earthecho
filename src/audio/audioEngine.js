@@ -858,3 +858,15 @@ export async function playCell(dataset, frameIndex = 0, x = 0, y = 0) {
   }
   return tone;
 }
+
+/**
+ * Plays a single prepared tone immediately (used for interactive probing of
+ * derived values such as signed differences).
+ * @param {object} tone - Tone from a mapping function.
+ * @returns {Promise<object>}
+ */
+export async function playTone(tone) {
+  await initAudio();
+  scheduleTone(tone, audioContext.currentTime);
+  return tone;
+}
