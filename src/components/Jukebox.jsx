@@ -2,18 +2,21 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   initAudio,
   playGrid,
+  playSoundscape,
   scanGrid,
+  playComparison,
+  playCell,
   stopAudio,
   setMasterVolume
 } from '../audio/audioEngine.js';
 
-// ─── helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
 function getFrameLabel(dataset, frameIndex) {
   const frame = dataset?.frames?.[frameIndex];
   if (frame?.label) return frame.label;
   if (frame?.timestamp) return frame.timestamp;
-  return `Frame ${frameIndex + 1}`;
+  return `Observation ${frameIndex + 1}`;
 }
 
 function getChannelLabel(dataset) {
@@ -44,18 +47,178 @@ function getDescription(dataset) {
 
 function getFrameCount(dataset) {
   if (dataset?.frames?.length) return dataset.frames.length;
-  return 1; // v1.0 single-frame
+  return 1;
+}
+
+function getActiveMatrix(dataset, frameIndex) {
+  if (!dataset) return null;
+  if (dataset.values) return dataset.values;
+  const frame = dataset.frames?.[frameIndex];
+  if (!frame?.values) return null;
+  const channelId = dataset.channels?.[0]?.id || Object.keys(frame.values)[0];
+  return frame.values[channelId] || null;
+}
+
+// ─── Interactive Grid Explorer ──────────────────────────────────────────────
+
+function GridExplorer({ dataset, frameIndex }) {
+  const canvasRef = useRef(null);
+  const [selectedCell, setSelectedCell] = useState(null);
+  const [focusedCoord, setFocusedCoord] = useState({ x: 0, y: 0 });
+  const matrix = getActiveMatrix(dataset, frameIndex);
+
+  const width = dataset?.width || 64;
+  const height = dataset?.height || 32;
+
+  // Determine color scheme based on dataset category
+  const isOcean = dataset?.id?.includes('ocean') || dataset?.id?.includes('sea');
+  const isVegetation = dataset?.id?.includes('vegetation') || dataset?.id?.includes('forest') || dataset?.id?.includes('ndvi');
+
+  const drawGrid = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !matrix) return;
+    const ctx = canvas.getContext('2d');
+    const cw = canvas.width / width;
+    const ch = canvas.height / height;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const val = matrix[y]?.[x];
+        if (val === null || val === undefined) {
+          ctx.fillStyle = '#06100e';
+        } else {
+          const intensity = Math.max(0, Math.min(1, val));
+          if (isOcean) {
+            const r = Math.round(15 + intensity * 60);
+            const g = Math.round(50 + intensity * 180);
+            const b = Math.round(120 + intensity * 135);
+            ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+          } else if (isVegetation) {
+            const r = Math.round(20 + (1 - intensity) * 80);
+            const g = Math.round(60 + intensity * 190);
+            const b = Math.round(30 + intensity * 80);
+            ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+          } else {
+            // Night Lights (warm gold/amber glow)
+            const r = Math.round(intensity * 255);
+            const g = Math.round(intensity * 215);
+            const b = Math.round(intensity * 120);
+            ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+          }
+        }
+        ctx.fillRect(x * cw, y * ch, cw, ch);
+      }
+    }
+
+    // Highlight hovered/focused cell
+    if (focusedCoord) {
+      ctx.strokeStyle = '#9cdbbd';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(focusedCoord.x * cw, focusedCoord.y * ch, cw, ch);
+    }
+  }, [matrix, width, height, isOcean, isVegetation, focusedCoord]);
+
+  useEffect(() => {
+    drawGrid();
+  }, [drawGrid]);
+
+  const triggerCell = useCallback(async (x, y) => {
+    setFocusedCoord({ x, y });
+    const val = matrix?.[y]?.[x];
+    if (val === null || val === undefined) {
+      setSelectedCell({ x, y, value: null, note: 'Silence (masked cell)' });
+      return;
+    }
+    try {
+      const tone = await playCell(dataset, frameIndex, x, y);
+      setSelectedCell({
+        x,
+        y,
+        value: val,
+        note: tone ? `${tone.frequencyHz.toFixed(1)} Hz (MIDI ${tone.midi})` : 'Silence'
+      });
+    } catch {
+      // ignore
+    }
+  }, [dataset, frameIndex, matrix]);
+
+  const handleCanvasClick = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const clickX = (e.clientX - rect.left) * scaleX;
+    const clickY = (e.clientY - rect.top) * scaleY;
+    const cellX = Math.floor(clickX / (canvas.width / width));
+    const cellY = Math.floor(clickY / (canvas.height / height));
+    const clampedX = Math.max(0, Math.min(width - 1, cellX));
+    const clampedY = Math.max(0, Math.min(height - 1, cellY));
+    triggerCell(clampedX, clampedY);
+  };
+
+  const handleKeyDown = (e) => {
+    let { x, y } = focusedCoord;
+    if (e.key === 'ArrowRight') { x = Math.min(width - 1, x + 1); e.preventDefault(); }
+    else if (e.key === 'ArrowLeft') { x = Math.max(0, x - 1); e.preventDefault(); }
+    else if (e.key === 'ArrowDown') { y = Math.min(height - 1, y + 1); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { y = Math.max(0, y - 1); e.preventDefault(); }
+    else if (e.key === 'Enter' || e.key === ' ') { triggerCell(x, y); e.preventDefault(); return; }
+    else return;
+
+    setFocusedCoord({ x, y });
+    triggerCell(x, y);
+  };
+
+  return (
+    <section className="grid-explorer-panel" aria-label="Interactive Earth Grid Explorer">
+      <div className="explorer-header">
+        <h4>Explore Grid Cells</h4>
+        <span className="explorer-instructions">
+          Click or use arrow keys + space to probe individual grid points
+        </span>
+      </div>
+
+      <div className="canvas-wrapper">
+        <canvas
+          ref={canvasRef}
+          width={512}
+          height={256}
+          className="grid-canvas"
+          onClick={handleCanvasClick}
+          onKeyDown={handleKeyDown}
+          tabIndex={0}
+          role="application"
+          aria-label={`Interactive ${width} by ${height} data grid. Focus and use arrow keys to explore coordinates.`}
+        />
+      </div>
+
+      <div className="cell-probe-readout" aria-live="polite">
+        {selectedCell ? (
+          <span>
+            <strong>Cell ({selectedCell.x}, {selectedCell.y})</strong> · Value: {selectedCell.value !== null ? selectedCell.value.toFixed(4) : 'Null'} · Pitch: {selectedCell.note}
+          </span>
+        ) : (
+          <span className="text-muted">Probe any coordinate to hear its sonified pitch.</span>
+        )}
+      </div>
+    </section>
+  );
 }
 
 // ─── PlaybackControls ────────────────────────────────────────────────────────
 
 function PlaybackControls({ dataset, frameIndex }) {
-  const [mode, setMode] = useState(null); // null | 'listen' | 'scan'
+  const [mode, setMode] = useState(null); // 'listen' | 'scan' | 'timelapse' | 'compare'
   const [audioError, setAudioError] = useState('');
   const [volume, setVolume] = useState(0.7);
   const playPromise = useRef(null);
 
-  // stop on dataset or frame change
+  const frameCount = getFrameCount(dataset);
+  const canCompare = frameCount >= 2;
+
   useEffect(() => {
     if (mode) {
       stopAudio();
@@ -64,13 +227,17 @@ function PlaybackControls({ dataset, frameIndex }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataset?.id, frameIndex]);
 
-  // cleanup on unmount
   useEffect(() => () => stopAudio(), []);
 
   const handleVolume = useCallback((e) => {
     const v = Number(e.target.value);
     setVolume(v);
-    try { setMasterVolume(v); } catch { /* ignore before init */ }
+    try { setMasterVolume(v); } catch { /* ignore */ }
+  }, []);
+
+  const handleStop = useCallback(() => {
+    stopAudio();
+    setMode(null);
   }, []);
 
   const startMode = useCallback(async (newMode) => {
@@ -91,9 +258,23 @@ function PlaybackControls({ dataset, frameIndex }) {
 
     setMode(newMode);
     try {
-      const promise = newMode === 'listen'
-        ? playGrid(dataset, frameIndex, { frameIntervalSeconds: 2 })
-        : scanGrid(dataset, frameIndex);
+      let promise;
+      if (newMode === 'listen') {
+        // Immersive musical soundscape sweep of the selected observation
+        promise = playSoundscape(dataset, frameIndex, { durationSeconds: 14 });
+      } else if (newMode === 'scan') {
+        // Sequential grid scan
+        promise = scanGrid(dataset, frameIndex);
+      } else if (newMode === 'timelapse') {
+        // Multi-observation time series playback
+        promise = playGrid(dataset, 0, { frameIntervalSeconds: 1.5 });
+      } else if (newMode === 'compare') {
+        // Differential sonification between first two frames
+        const ch = dataset.channels?.[0]?.id || Object.keys(dataset.frames[0].values)[0];
+        const f0 = { ...dataset, values: dataset.frames[0].values[ch] };
+        const f1 = { ...dataset, values: dataset.frames[1].values[ch] };
+        promise = playComparison(f0, f1);
+      }
       playPromise.current = promise;
       await promise;
     } catch (err) {
@@ -106,40 +287,69 @@ function PlaybackControls({ dataset, frameIndex }) {
     }
   }, [dataset, frameIndex, mode, volume]);
 
-  const handleStop = useCallback(() => {
-    stopAudio();
-    setMode(null);
-  }, []);
-
   const isPlaying = mode !== null;
 
   return (
     <div className="playback-controls" role="group" aria-label="Playback controls">
-
       <div className="control-row">
+        {/* Listen: Soundscape */}
         <button
           className={`control-btn primary${mode === 'listen' ? ' active' : ''}`}
           type="button"
           aria-pressed={mode === 'listen'}
           onClick={() => mode === 'listen' ? handleStop() : startMode('listen')}
           disabled={!dataset}
+          title="Play a 14-second musical soundscape of this observation"
         >
-          {mode === 'listen' ? '⏹ Stop' : '▶ Listen'}
+          {mode === 'listen' ? '⏹ Stop' : '▶ Listen (Soundscape)'}
         </button>
 
+        {/* Scan: Left to right */}
         <button
           className={`control-btn${mode === 'scan' ? ' active' : ''}`}
           type="button"
           aria-pressed={mode === 'scan'}
           onClick={() => mode === 'scan' ? handleStop() : startMode('scan')}
           disabled={!dataset}
+          title="Scan grid column-by-column from West to East"
         >
-          {mode === 'scan' ? '⏹ Stop' : '⟶ Scan'}
+          {mode === 'scan' ? '⏹ Stop' : '⟶ Scan Grid'}
         </button>
+
+        {/* Timelapse (if multiple frames) */}
+        {frameCount > 1 && (
+          <button
+            className={`control-btn${mode === 'timelapse' ? ' active' : ''}`}
+            type="button"
+            aria-pressed={mode === 'timelapse'}
+            onClick={() => mode === 'timelapse' ? handleStop() : startMode('timelapse')}
+            disabled={!dataset}
+            title="Play time-lapse sequence of all observations"
+          >
+            {mode === 'timelapse' ? '⏹ Stop' : '⏱ Timelapse'}
+          </button>
+        )}
+
+        {/* Compare: Differences */}
+        {canCompare && (
+          <button
+            className={`control-btn${mode === 'compare' ? ' active' : ''}`}
+            type="button"
+            aria-pressed={mode === 'compare'}
+            onClick={() => mode === 'compare' ? handleStop() : startMode('compare')}
+            disabled={!dataset}
+            title="Hear changes between first and second observation (high = increase, low = decrease)"
+          >
+            {mode === 'compare' ? '⏹ Stop' : '⚖ Compare Differences'}
+          </button>
+        )}
 
         {isPlaying && (
           <span className="status-pill playing" role="status" aria-live="polite">
-            {mode === 'listen' ? '♪ Playing…' : '⟶ Scanning…'}
+            {mode === 'listen' && '♪ Soundscape playing…'}
+            {mode === 'scan' && '⟶ Scanning grid…'}
+            {mode === 'timelapse' && '⏱ Timelapse playing…'}
+            {mode === 'compare' && '⚖ Comparing differences…'}
           </span>
         )}
       </div>
@@ -163,7 +373,7 @@ function PlaybackControls({ dataset, frameIndex }) {
       )}
 
       <p className="controls-hint">
-        <strong>Listen</strong> plays a summary tone per frame. <strong>Scan</strong> sweeps left-to-right, one column at a time.
+        <strong>Listen</strong> weaves an evocative 14s soundscape across the globe. <strong>Scan</strong> audits coordinates from left to right. <strong>Compare</strong> voices signed deltas.
       </p>
     </div>
   );
@@ -183,11 +393,11 @@ function DatasetCard({ dataset, frameIndex, onFrameChange }) {
       <div className="dataset-card-heading">
         <div>
           <p className="eyebrow">
-            {dataset.schema_version === '1.1' ? 'NASA DATA' : 'SYNTHETIC DATA'}
+            {dataset.schema_version === '1.1' ? 'NASA EARTH OBSERVATION' : 'SYNTHETIC TEST DATA'}
           </p>
           <h3>{dataset.title}</h3>
         </div>
-        <span className="grid-size">{dataset.width} × {dataset.height} grid</span>
+        <span className="grid-size">{dataset.width} × {dataset.height} numerical grid</span>
       </div>
 
       <p className="dataset-description">{getDescription(dataset)}</p>
@@ -195,7 +405,7 @@ function DatasetCard({ dataset, frameIndex, onFrameChange }) {
       {/* Frame selector */}
       {frameCount > 1 && (
         <div className="frame-selector">
-          <label className="field-label" htmlFor="frame-select">Observation</label>
+          <label className="field-label" htmlFor="frame-select">Observation period</label>
           <div className="frame-select-row">
             <select
               id="frame-select"
@@ -210,7 +420,7 @@ function DatasetCard({ dataset, frameIndex, onFrameChange }) {
               ))}
             </select>
             <span className="frame-badge">
-              {frameIndex + 1} / {frameCount}
+              Observation {frameIndex + 1} of {frameCount}
             </span>
           </div>
         </div>
@@ -218,8 +428,8 @@ function DatasetCard({ dataset, frameIndex, onFrameChange }) {
 
       {/* Audio legend */}
       {dataset.sonification_profile && (
-        <details className="audio-legend">
-          <summary>How this sounds</summary>
+        <details className="audio-legend" open>
+          <summary>Audio Legend & Sound Mapping</summary>
           <dl className="legend-list">
             {channelLabel && (
               <div>
@@ -249,14 +459,14 @@ function DatasetCard({ dataset, frameIndex, onFrameChange }) {
         </details>
       )}
 
-      {/* Attribution */}
+      {/* Provenance */}
       <dl className="dataset-details">
         <div>
           <dt>Source</dt>
           <dd>
             {getSourceOrg(dataset)}
             {sourceUrl && (
-              <> · <a href={sourceUrl} target="_blank" rel="noreferrer noopener">Source link ↗</a></>
+              <> · <a href={sourceUrl} target="_blank" rel="noreferrer noopener">Official link ↗</a></>
             )}
           </dd>
         </div>
@@ -268,23 +478,23 @@ function DatasetCard({ dataset, frameIndex, onFrameChange }) {
         )}
         {disclaimer && (
           <div>
-            <dt>Data note</dt>
+            <dt>Scientific Note</dt>
             <dd>{disclaimer}</dd>
           </div>
         )}
       </dl>
 
-      {dataset.id.startsWith('mock:') && (
+      {dataset.id?.startsWith('mock:') && (
         <p className="demo-notice">
-          Synthetic demonstration only. This grid is illustrative, not NASA-derived
-          source data or calibrated satellite radiance.
+          Synthetic demonstration baseline. This grid is mathematically generated for interface
+          development, not calibrated satellite observations.
         </p>
       )}
     </article>
   );
 }
 
-// ─── Jukebox (main export) ───────────────────────────────────────────────────
+// ─── Jukebox (Main Component) ────────────────────────────────────────────────
 
 export default function Jukebox({
   datasets,
@@ -298,7 +508,6 @@ export default function Jukebox({
 }) {
   const [frameIndex, setFrameIndex] = useState(0);
 
-  // reset frame when dataset changes
   useEffect(() => setFrameIndex(0), [selectedId]);
 
   const manifestDatasets = datasets.filter((e) => e.kind === 'manifest');
@@ -316,11 +525,12 @@ export default function Jukebox({
 
       <section className="welcome-panel" id="home" aria-labelledby="page-title">
         <div className="welcome-copy">
-          <p className="eyebrow">AN ACCESSIBLE EARTH JUKEBOX</p>
+          <p className="eyebrow">NASA SPACE APPS CHALLENGE · EARTH JUKEBOX</p>
           <h1 id="page-title">Listen to the shape<br />of our changing planet.</h1>
           <p className="intro">
-            Earth Echo turns NASA Earth data into sound. Choose a dataset, pick an
-            observation, then press <strong>Listen</strong> or <strong>Scan</strong>.
+            Earth Echo translates NASA satellite visualizations and physical indices
+            into soundscapes. Select an observation, listen to its global timbre,
+            sweep across coordinates, or probe differences across years.
           </p>
         </div>
       </section>
@@ -328,8 +538,8 @@ export default function Jukebox({
       <section className="dataset-panel" aria-labelledby="dataset-heading">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">START HERE</p>
-            <h2 id="dataset-heading">Choose an observation</h2>
+            <p className="eyebrow">DATASET SELECTION</p>
+            <h2 id="dataset-heading">Choose a NASA Observation</h2>
           </div>
           {dataStatus === 'loading' && (
             <span className="status-pill" role="status">Loading data…</span>
@@ -346,14 +556,14 @@ export default function Jukebox({
         >
           {datasets.length === 0 && <option value="">No datasets available</option>}
           {manifestDatasets.length > 0 && (
-            <optgroup label="NASA datasets">
+            <optgroup label="Verified NASA Observations">
               {manifestDatasets.map((entry) => (
                 <option key={entry.id} value={entry.id}>{entry.label}</option>
               ))}
             </optgroup>
           )}
           {mockDatasets.length > 0 && (
-            <optgroup label="Synthetic test data">
+            <optgroup label="Synthetic Test Data">
               {mockDatasets.map((entry) => (
                 <option key={entry.id} value={entry.id}>{entry.label}</option>
               ))}
@@ -379,7 +589,13 @@ export default function Jukebox({
               frameIndex={frameIndex}
               onFrameChange={setFrameIndex}
             />
+
             <PlaybackControls
+              dataset={dataset}
+              frameIndex={frameIndex}
+            />
+
+            <GridExplorer
               dataset={dataset}
               frameIndex={frameIndex}
             />
@@ -387,19 +603,21 @@ export default function Jukebox({
         )}
 
         <p className="manifest-note">
-          NASA datasets are discovered from <code>/data/manifest.json</code>. Attribution
-          and disclaimers are displayed as supplied by the dataset files.
+          Datasets are loaded dynamically from <code>/data/manifest.json</code> conforming to
+          Earth Echo Schema v1.1. Audio is rendered purely client-side via the Web Audio API.
         </p>
       </section>
 
       <footer className="site-footer">
-        <p>Designed to make Earth data more approachable through sound.</p>
+        <p>Built for the NASA Space Apps Challenge · Making Earth Science Accessible</p>
         <details className="accessibility-details" id="accessibility">
-          <summary>Accessibility information</summary>
+          <summary>Accessibility & Sonification Guide</summary>
           <p>
-            All controls are keyboard accessible. The dataset selector, frame selector,
-            and volume slider work with screen readers. Reduced-motion preferences are respected.
-            Audio starts only on user interaction.
+            This application complies with WCAG accessibility guidelines:
+            All controls are keyboard navigable (Tab, Space, Enter, Arrows).
+            Screen reader announcements provide status updates on playback and probe state.
+            Web Audio starts strictly upon user interaction, with volume control and instant stop.
+            Reduced motion settings are honored.
           </p>
         </details>
       </footer>
