@@ -1,0 +1,364 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #eef4f2;
+  background: #071311;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-optical-sizing: auto;
+  font-weight: 400;
+
+  --surface: #0e1e1b;
+  --surface-raised: #142723;
+  --text-muted: #a4b8b2;
+  --accent: #9cdbbd;
+  --line: #28403a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(ellipse at 80% 6%, rgba(35, 83, 68, 0.19), transparent 34rem),
+    #071311;
+}
+
+button,
+select {
+  font: inherit;
+}
+
+a {
+  color: var(--accent);
+}
+
+a:hover {
+  color: #c3f4dc;
+}
+
+:focus-visible {
+  outline: 3px solid #f1c875;
+  outline-offset: 4px;
+}
+
+.page-shell {
+  width: min(100% - 48px, 1080px);
+  margin: 0 auto;
+}
+
+.site-header {
+  min-height: 78px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(164, 184, 178, 0.15);
+}
+
+.wordmark {
+  display: inline-flex;
+  gap: 10px;
+  align-items: center;
+  color: #eef4f2;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.wordmark-mark {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #85c9a9;
+  border-radius: 50%;
+  color: var(--accent);
+}
+
+.header-label,
+.eyebrow {
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+}
+
+.welcome-panel {
+  position: relative;
+  min-height: 330px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border-bottom: 1px solid rgba(164, 184, 178, 0.15);
+}
+
+.welcome-copy {
+  position: relative;
+  z-index: 1;
+  max-width: 620px;
+  padding: 48px 0 58px;
+}
+
+.eyebrow {
+  margin: 0 0 13px;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 18px;
+  font-size: clamp(2.35rem, 5vw, 4.2rem);
+  line-height: 1.06;
+  letter-spacing: -0.055em;
+}
+
+.intro {
+  max-width: 520px;
+  margin-bottom: 0;
+  color: var(--text-muted);
+  font-size: 1.05rem;
+  line-height: 1.7;
+}
+
+.dataset-panel {
+  max-width: 760px;
+  padding: 42px 0 48px;
+}
+
+.section-heading,
+.dataset-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+h2 {
+  margin-bottom: 26px;
+  font-size: clamp(1.45rem, 3vw, 1.8rem);
+  letter-spacing: -0.03em;
+}
+
+.status-pill,
+.grid-size {
+  display: inline-block;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 9px;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.dataset-select {
+  width: min(100%, 520px);
+  min-height: 48px;
+  padding: 0 42px 0 14px;
+  border: 1px solid #456158;
+  border-radius: 8px;
+  color: #eef4f2;
+  background: var(--surface);
+}
+
+.dataset-select:hover {
+  border-color: var(--accent);
+}
+
+.dataset-card {
+  margin-top: 24px;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(20, 39, 35, 0.96), rgba(11, 25, 23, 0.96));
+}
+
+.dataset-card h3 {
+  margin-bottom: 0;
+  font-size: 1.28rem;
+}
+
+.dataset-card-heading .eyebrow {
+  margin-bottom: 7px;
+}
+
+.dataset-description {
+  margin: 18px 0;
+  color: var(--text-muted);
+  line-height: 1.65;
+}
+
+.dataset-details {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.7fr) 1.3fr;
+  gap: 16px;
+  margin: 0;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.dataset-details dt {
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.dataset-details dd {
+  margin: 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.demo-notice {
+  margin: 20px 0 0;
+  padding: 12px 14px;
+  border-left: 3px solid #d5b66e;
+  color: #e8d9ad;
+  background: rgba(213, 182, 110, 0.08);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.manifest-note,
+.loading-message {
+  margin: 18px 0 0;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+code {
+  color: #c3f4dc;
+}
+
+.error-message {
+  max-width: 520px;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid #86584b;
+  border-radius: 8px;
+  color: #ffd5c8;
+  background: rgba(115, 48, 34, 0.2);
+}
+
+.error-message p {
+  margin-bottom: 8px;
+}
+
+.text-button {
+  min-height: 36px;
+  padding: 4px 0;
+  border: 0;
+  color: #ffd5c8;
+  background: transparent;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.site-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px 0 30px;
+  border-top: 1px solid rgba(164, 184, 178, 0.15);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.site-footer p {
+  margin: 0;
+}
+
+.accessibility-details {
+  max-width: 380px;
+}
+
+.accessibility-details summary {
+  color: var(--accent);
+  cursor: pointer;
+  min-height: 36px;
+}
+
+.accessibility-details p {
+  padding-top: 8px;
+  line-height: 1.5;
+}
+
+@media (max-width: 650px) {
+  .page-shell {
+    width: min(100% - 32px, 1080px);
+  }
+
+  .site-header {
+    min-height: 66px;
+  }
+
+  .header-label {
+    max-width: 120px;
+    text-align: right;
+    font-size: 0.62rem;
+  }
+
+  .welcome-panel {
+    min-height: 0;
+  }
+
+  .welcome-copy {
+    padding: 42px 0 34px;
+  }
+
+  .section-heading {
+    display: block;
+  }
+
+  .status-pill {
+    margin: -12px 0 18px;
+  }
+
+  .dataset-card {
+    padding: 18px;
+  }
+
+  .dataset-card-heading {
+    display: block;
+  }
+
+  .grid-size {
+    margin-top: 12px;
+  }
+
+  .dataset-details {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .site-footer {
+    flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
