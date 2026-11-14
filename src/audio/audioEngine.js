@@ -576,6 +576,7 @@ function startPlayback(events, timelineDurationSeconds) {
       }
 
       if (session.nextEventIndex === events.length && now >= session.endTime) {
+        stopActiveVoices();
         settlePlaybackSession(session, undefined, null);
         return;
       }
