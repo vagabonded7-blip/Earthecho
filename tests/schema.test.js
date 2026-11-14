@@ -99,18 +99,33 @@ test('Schema v1.1: getFrameChannelValues retrieves values[channelId][y][x]', () 
   assert.equal(gridFrame1[10][10], 0.8);
 });
 
-test('Schema v1.1: validateCompatibility enforces semantic and dimensional match', () => {
+test('Schema v1.1: validateCompatibility enforces semantic and spatial compatibility', () => {
   const a = createCompliantFixture('a');
   const b = createCompliantFixture('b');
+
+  // Different datasets require verified spatial compatibility.
   const comp = validateCompatibility(a, b);
   assert.equal(comp.compatible, true);
 
-  // Mismatch type
+  // Reject mismatched channel semantics.
   const badType = createCompliantFixture('c');
   badType.channels[0].type = 'unmatched_type';
+
   const badComp = validateCompatibility(a, badType);
   assert.equal(badComp.compatible, false);
-  assert.ok(badComp.errors.some(e => e.includes('Semantic type mismatch')));
+  assert.ok(
+    badComp.errors.some(e => e.includes('semantic type mismatch'))
+  );
+
+  // Reject unverified spatial registration.
+  const unverified = createCompliantFixture('unverified');
+  unverified.projection = 'image_grid_unverified';
+
+  const spatialComp = validateCompatibility(a, unverified);
+  assert.equal(spatialComp.compatible, false);
+  assert.ok(
+    spatialComp.errors.some(e => e.includes('Spatial registration'))
+  );
 });
 
 test('Schema v1.1: calculateFrameDifference calculates correct signed deltas', () => {
@@ -130,4 +145,26 @@ test('Schema v1.1: Manifest file is valid', () => {
   const manifest = JSON.parse(fs.readFileSync('./public/data/manifest.json', 'utf8'));
   assert.equal(manifest.schema_version, '1.1');
   assert.ok(Array.isArray(manifest.datasets));
+});
+test('Rejects Infinity in dataset cells', () => {
+  const fixture = createCompliantFixture();
+  fixture.frames[0].values.brightness[10][10] = Infinity;
+
+  assert.equal(validateDataset(fixture).valid, false);
+});
+
+test('Rejects duplicate channel IDs', () => {
+  const fixture = createCompliantFixture();
+  fixture.channels.push({ ...fixture.channels[0] });
+
+  assert.equal(validateDataset(fixture).valid, false);
+});
+
+test('Rejects malformed channel definitions', () => {
+  const fixture = createCompliantFixture();
+  fixture.channels = [null];
+
+  const result = validateDataset(fixture);
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.length > 0);
 });
