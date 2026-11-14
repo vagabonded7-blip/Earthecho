@@ -12,6 +12,12 @@
       "path": "/data/ocean_ecco2_2007_2008.json",
       "label": "NASA ECCO2 Ocean Color Visualization 2007-2008",
       "comparison_group": "ocean_ecco2"
+    },
+    {
+      "id": "vegetation_modis_2020_2023",
+      "path": "/data/vegetation_modis_2020_2023.json",
+      "label": "NASA MODIS Vegetation NDVI 2020-2023",
+      "comparison_group": "vegetation_modis"
     }
   ]
 }
