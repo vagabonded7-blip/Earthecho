@@ -31,7 +31,7 @@ def preprocess_and_extract_luminance(
     crop_bottom: int = 0,
     crop_left: int = 0,
     crop_right: int = 0,
-    mask_polar_rows_percent: float = 6.25 # Top & bottom ~6% masked for extreme polar latitudes
+    mask_polar_rows_percent: float = 0.0 # Top & bottom ~6% masked for extreme polar latitudes
 ) -> np.ndarray:
     """
     Loads an image, applies boundary cropping to remove letterboxing/annotations,
@@ -44,6 +44,17 @@ def preprocess_and_extract_luminance(
     with Image.open(image_path) as img:
         width, height = img.size
         mode = img.mode
+                # Validate cropping parameters
+        crop_values = (crop_top, crop_bottom, crop_left, crop_right)
+
+        if any(value < 0 for value in crop_values):
+            raise ValueError("Crop values cannot be negative.")
+
+        if crop_left + crop_right >= width:
+            raise ValueError("Cropping removes the entire image width.")
+
+        if crop_top + crop_bottom >= height:
+            raise ValueError("Cropping removes the entire image height.")
         print(f"\n[Preprocessing] Ingesting: {os.path.basename(image_path)} ({width}x{height}, {mode})")
 
         # 1. Coordinate Bounding Box / Cropping Audit
@@ -65,8 +76,7 @@ def preprocess_and_extract_luminance(
 
         # 3. ITU-R BT.709 Perceived Luminance Calculation
         # Y is in range [0.0, 255.0]
-        luminance = (LUMA_R * r + LUMA_G * g + LUMA_B * b) * a
-
+        luminance = LUMA_R * r + LUMA_G * g + LUMA_B * b
         # Mask cells where alpha is 0
         luminance[a < 0.05] = np.nan
 
@@ -83,6 +93,11 @@ def preprocess_and_extract_luminance(
         valid_mask = ~np.isnan(luminance)
         valid_count = np.count_nonzero(valid_mask)
         total_count = luminance.size
+        if valid_count == 0:
+            raise ValueError(
+                "No valid pixels remain after preprocessing. "
+                "Check cropping, alpha transparency, and masking settings."
+            )
         print(f" [Luminance Extracted] Valid pixels: {valid_count} / {total_count} ({valid_count/total_count*100:.1f}%)")
         print(f"                      Min valid luma: {np.nanmin(luminance):.2f}, Max: {np.nanmax(luminance):.2f}")
 

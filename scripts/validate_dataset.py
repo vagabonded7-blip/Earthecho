@@ -1,169 +1,215 @@
-"""
-Earth Echo — Dataset Validation Suite (Python)
-
-MODULE 9: Automated Schema v1.1 and Dataset Verification
-Audits:
-  1. JSON parsing and structure.
-  2. schema_version == "1.1".
-  3. Exact dimensions: 32 rows x 64 columns across all frames and channels.
-  4. Numerical value bounds (valid floats within declared range or None/null).
-  5. Polar/null cell representation.
-  6. Required metadata fields (source, attribution, sonification_profile).
-  7. Shared normalization limits.
-  8. Manifest consistency (ensures every listed dataset exists on disk).
-
-Usage:
-  python scripts/validate_dataset.py --file public/data/night_lights_2012_2023.json
-  python scripts/validate_dataset.py --manifest public/data/manifest.json
-"""
-
-import os
-import sys
-import json
+"""Validate Earth Echo Schema v1.1 JSON datasets and manifest."""
 import argparse
+import json
+import math
+import sys
+from pathlib import Path
 
-EXPECTED_WIDTH = 64
-EXPECTED_HEIGHT = 32
+WIDTH, HEIGHT = 64, 32
 
-def validate_dataset_file(file_path: str) -> bool:
-    print(f"\n=======================================================")
-    print(f" DATASET INTEGRITY AUDIT: {os.path.basename(file_path)}")
-    print(f"=======================================================")
 
-    if not os.path.exists(file_path):
-        print(f" [FAIL] File does not exist: {file_path}")
-        return False
+def number(value):
+    return type(value) in (int, float) and math.isfinite(value)
 
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f" [FAIL] JSON Parse Error: {e}")
-        return False
 
+def nonempty(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def read_json(path):
+    def reject_constant(value):
+        raise ValueError(f'Non-standard JSON numeric constant: {value}')
+    with Path(path).open(encoding='utf-8') as file:
+        return json.load(file, parse_constant=reject_constant)
+
+
+def validate_dataset(data):
     errors = []
+    if not isinstance(data, dict):
+        return ['Dataset root must be a JSON object']
+    if data.get('schema_version') != '1.1':
+        errors.append('schema_version must be 1.1')
+    for key in ('id', 'title', 'description', 'projection'):
+        if not nonempty(data.get(key)):
+            errors.append(f'{key} must be a nonempty string')
+    if type(data.get('width')) is not int or data['width'] != WIDTH or type(data.get('height')) is not int or data['height'] != HEIGHT:
+        errors.append(f'Grid dimensions must be {WIDTH}x{HEIGHT}')
 
-    # 1. Schema Version
-    if data.get("schema_version") != "1.1":
-        errors.append(f"Invalid schema_version: expected '1.1', received '{data.get('schema_version')}'")
+    source = data.get('source')
+    if not isinstance(source, dict):
+        errors.append('source must be an object')
+    else:
+        for key in ('organization', 'url', 'attribution', 'disclaimer'):
+            if not nonempty(source.get(key)):
+                errors.append(f'source.{key} must be a nonempty string')
 
-    # 2. Dimensions
-    if data.get("width") != EXPECTED_WIDTH or data.get("height") != EXPECTED_HEIGHT:
-        errors.append(f"Dimension mismatch: expected {EXPECTED_WIDTH}x{EXPECTED_HEIGHT}, got {data.get('width')}x{data.get('height')}")
+    norm = data.get('normalization')
+    if not isinstance(norm, dict):
+        errors.append('normalization must be an object')
+    else:
+        if norm.get('method') != 'shared_linear':
+            errors.append('normalization.method must be shared_linear')
+        lo, hi = norm.get('source_min'), norm.get('source_max')
+        if not number(lo) or not number(hi) or lo >= hi:
+            errors.append('normalization source_min/source_max must be finite numbers with min < max')
 
-    # 3. Required Metadata
-    for req in ["id", "title", "source", "channels", "sonification_profile", "frames"]:
-        if req not in data:
-            errors.append(f"Missing top-level key: '{req}'")
-
-    # 4. Source Metadata
-    src = data.get("source", {})
-    if not src.get("organization") or not src.get("url") or not src.get("attribution"):
-        errors.append("source must contain 'organization', 'url', and 'attribution'")
-
-    # 5. Normalization Metadata
-    norm = data.get("normalization", {})
-    if norm.get("source_min") is None or norm.get("source_max") is None:
-        errors.append("normalization must define 'source_min' and 'source_max'")
-
-    # 6. Frames and Channels
-    frames = data.get("frames", [])
-    channels = data.get("channels", [])
-    if not isinstance(frames, list) or len(frames) == 0:
-        errors.append("frames must be a non-empty list")
-    if not isinstance(channels, list) or len(channels) == 0:
-        errors.append("channels must be a non-empty list")
-
-    channel_ranges = {c.get("id"): c.get("range", [-float("inf"), float("inf")]) for c in channels if "id" in c}
-
-    for f_idx, frame in enumerate(frames):
-        if "frame_index" not in frame or "label" not in frame or "values" not in frame:
-            errors.append(f"Frame [{f_idx}] missing required keys (frame_index, label, values)")
+    channels = data.get('channels')
+    channel_ids = []
+    ranges = {}
+    if not isinstance(channels, list) or not channels:
+        errors.append('channels must be a nonempty list')
+        channels = []
+    for i, channel in enumerate(channels):
+        if not isinstance(channel, dict):
+            errors.append(f'channels[{i}] must be an object')
             continue
+        for key in ('id', 'name', 'type', 'description'):
+            if not nonempty(channel.get(key)):
+                errors.append(f'channels[{i}].{key} must be a nonempty string')
+        unit = channel.get('unit')
+        if unit is not None and not isinstance(unit, str):
+            errors.append(f'channels[{i}].unit must be string or null')
+        ident = channel.get('id')
+        if not nonempty(ident):
+            continue
+        if ident in channel_ids:
+            errors.append(f'Duplicate channel ID: {ident}')
+        channel_ids.append(ident)
+        rng = channel.get('range')
+        if not isinstance(rng, list) or len(rng) != 2 or not all(number(v) for v in rng) or rng[0] >= rng[1]:
+            errors.append(f'channels[{i}].range must be [finite_min, finite_max]')
+        else:
+            ranges[ident] = rng
 
-        values = frame["values"]
-        for ch_id, ch_range in channel_ranges.items():
-            if ch_id not in values:
-                errors.append(f"Frame [{f_idx}] missing grid for channel '{ch_id}'")
+    profile = data.get('sonification_profile')
+    if not isinstance(profile, dict):
+        errors.append('sonification_profile must be an object')
+    else:
+        if profile.get('default_channel') not in channel_ids:
+            errors.append('sonification_profile.default_channel must refer to a channel')
+        if not nonempty(profile.get('scale')) or not number(profile.get('base_frequency')) or profile['base_frequency'] <= 0:
+            errors.append('sonification_profile requires scale and positive base_frequency')
+        pitch = profile.get('pitch_mapping')
+        if not isinstance(pitch, dict) or pitch.get('channel') not in channel_ids or not all(number(pitch.get(k)) for k in ('min_hz', 'max_hz')) or not number(pitch.get('min_hz')) or pitch['min_hz'] <= 0 or pitch['min_hz'] >= pitch['max_hz'] or not nonempty(pitch.get('curve')):
+            errors.append('sonification_profile.pitch_mapping is invalid')
+        spatial = profile.get('spatial_mapping')
+        if not isinstance(spatial, dict) or not all(nonempty(spatial.get(k)) for k in ('mode', 'x_axis', 'y_axis')):
+            errors.append('sonification_profile.spatial_mapping is invalid')
+        legend = profile.get('legend')
+        if not isinstance(legend, dict) or not all(nonempty(legend.get(k)) for k in ('pitch', 'stereo', 'silence')):
+            errors.append('sonification_profile.legend is invalid')
+
+    frames = data.get('frames')
+    if not isinstance(frames, list) or not frames:
+        errors.append('frames must be a nonempty list')
+        frames = []
+    indices = []
+    for fi, frame in enumerate(frames):
+        if not isinstance(frame, dict):
+            errors.append(f'frames[{fi}] must be an object')
+            continue
+        idx = frame.get('frame_index')
+        if type(idx) is not int or idx < 0:
+            errors.append(f'frames[{fi}].frame_index must be a nonnegative integer')
+        else:
+            indices.append(idx)
+            if idx != fi:
+                errors.append(f'frames[{fi}].frame_index must equal {fi}')
+        if not nonempty(frame.get('label')) or not nonempty(frame.get('timestamp')):
+            errors.append(f'frames[{fi}] requires nonempty label and timestamp')
+        else:
+            stamp = frame['timestamp']
+            if not (stamp.isdigit() and len(stamp) == 4) and not _iso_timestamp(stamp):
+                errors.append(f'frames[{fi}].timestamp must be YYYY or ISO date/time')
+        values = frame.get('values')
+        if not isinstance(values, dict):
+            errors.append(f'frames[{fi}].values must be an object')
+            continue
+        for ch in channel_ids:
+            grid = values.get(ch)
+            if not isinstance(grid, list) or len(grid) != HEIGHT:
+                errors.append(f'frames[{fi}].values.{ch} must contain {HEIGHT} rows')
                 continue
-
-            grid = values[ch_id]
-            if len(grid) != EXPECTED_HEIGHT:
-                errors.append(f"Frame [{f_idx}] channel '{ch_id}' row count must be {EXPECTED_HEIGHT}, got {len(grid)}")
-                continue
-
             for y, row in enumerate(grid):
-                if len(row) != EXPECTED_WIDTH:
-                    errors.append(f"Frame [{f_idx}] channel '{ch_id}' row {y} col count must be {EXPECTED_WIDTH}, got {len(row)}")
-                    break
+                if not isinstance(row, list) or len(row) != WIDTH:
+                    errors.append(f'frames[{fi}].values.{ch}[{y}] must contain {WIDTH} cells')
+                    continue
                 for x, val in enumerate(row):
-                    if val is not None:
-                        if not isinstance(val, (int, float)):
-                            errors.append(f"Frame [{f_idx}] cell [{y}][{x}] invalid non-number: {val}")
-                            break
-                        if val < ch_range[0] or val > ch_range[1]:
-                            errors.append(f"Frame [{f_idx}] cell [{y}][{x}] value {val} out of bounds [{ch_range[0]}, {ch_range[1]}]")
-                            break
+                    if val is None:
+                        continue
+                    if not number(val):
+                        errors.append(f'frames[{fi}].values.{ch}[{y}][{x}] must be finite number or null')
+                    elif ch in ranges and not ranges[ch][0] <= val <= ranges[ch][1]:
+                        errors.append(f'frames[{fi}].values.{ch}[{y}][{x}] outside channel range')
+        if set(values) != set(channel_ids):
+            errors.append(f'frames[{fi}] channel grid IDs do not match channels list')
+    if len(indices) != len(set(indices)):
+        errors.append('Duplicate frame indices')
+    return errors
 
-    if errors:
-        print(f" [FAIL] Found {len(errors)} validation errors:")
-        for err in errors[:10]:
-            print(f"   - {err}")
-        if len(errors) > 10:
-            print(f"   ... and {len(errors) - 10} more.")
-        return False
-    else:
-        print(f" [PASS] Valid Schema v1.1 dataset!")
-        print(f"        Frames: {len(frames)}, Channels: {list(channel_ranges.keys())}")
-        print(f"        Dimensions: {data['width']} x {data['height']}")
+
+def _iso_timestamp(value):
+    from datetime import datetime
+    try:
+        datetime.fromisoformat(value.replace('Z', '+00:00'))
         return True
-
-def validate_manifest_file(manifest_path: str = "public/data/manifest.json") -> bool:
-    print(f"\n=======================================================")
-    print(f" MANIFEST INTEGRITY AUDIT: {manifest_path}")
-    print(f"=======================================================")
-
-    if not os.path.exists(manifest_path):
-        print(f" [FAIL] Manifest not found: {manifest_path}")
+    except ValueError:
         return False
 
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
 
-    if manifest.get("schema_version") != "1.1":
-        print(f" [FAIL] Manifest schema_version is '{manifest.get('schema_version')}', expected '1.1'")
+def validate_dataset_file(file_path):
+    print(f'\n[Dataset Audit] {file_path}')
+    try:
+        errors = validate_dataset(read_json(file_path))
+    except (OSError, ValueError, TypeError) as exc:
+        errors = [str(exc)]
+    if errors:
+        for message in errors[:20]:
+            print(' [FAIL]', message)
+        if len(errors) > 20:
+            print(f' ... {len(errors) - 20} additional errors')
         return False
+    print(' [PASS] Valid Schema v1.1 dataset')
+    return True
 
-    datasets = manifest.get("datasets", [])
-    print(f" Manifest registers {len(datasets)} dataset(s).")
 
-    all_valid = True
-    for ds in datasets:
-        ds_id = ds.get("id")
-        web_path = ds.get("path")
-        local_path = os.path.join("public", web_path.lstrip("/"))
-
-        print(f" Checking: {ds_id} -> {local_path}")
-        if not os.path.exists(local_path):
-            print(f"   [FAIL] Target file does not exist on disk: {local_path}")
-            all_valid = False
+def validate_manifest_file(manifest_path='public/data/manifest.json'):
+    print(f'\n[Manifest Audit] {manifest_path}')
+    try:
+        manifest = read_json(manifest_path)
+    except (OSError, ValueError, TypeError) as exc:
+        print(' [FAIL]', exc)
+        return False
+    if not isinstance(manifest, dict) or manifest.get('schema_version') != '1.1' or not isinstance(manifest.get('datasets'), list):
+        print(' [FAIL] Invalid Schema v1.1 manifest')
+        return False
+    public = Path(manifest_path).resolve().parent.parent
+    seen = set()
+    ok = True
+    for entry in manifest['datasets']:
+        if not isinstance(entry, dict) or any(not nonempty(entry.get(k)) for k in ('id', 'path', 'label', 'comparison_group')):
+            print(' [FAIL] Invalid manifest entry')
+            ok = False
             continue
+        if entry['id'] in seen:
+            print(' [FAIL] Duplicate dataset ID:', entry['id'])
+            ok = False
+        seen.add(entry['id'])
+        web_path = entry['path']
+        target = (public / web_path.lstrip('/')).resolve()
+        if not web_path.startswith('/') or not target.is_relative_to(public) or target.suffix.lower() != '.json':
+            print(' [FAIL] Invalid dataset path:', web_path)
+            ok = False
+            continue
+        if not validate_dataset_file(target):
+            ok = False
+    print(' [PASS] Manifest validated' if ok else ' [FAIL] Manifest validation failed')
+    return ok
 
-        if not validate_dataset_file(local_path):
-            all_valid = False
 
-    return all_valid
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Audit and validate Earth Echo datasets.")
-    parser.add_argument("--file", type=str, help="Dataset JSON file to validate")
-    parser.add_argument("--manifest", type=str, default="public/data/manifest.json", help="Manifest JSON file to validate")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Validate Earth Echo Schema v1.1 files')
+    parser.add_argument('--file')
+    parser.add_argument('--manifest', default='public/data/manifest.json')
     args = parser.parse_args()
-
-    if args.file:
-        success = validate_dataset_file(args.file)
-        sys.exit(0 if success else 1)
-    else:
-        success = validate_manifest_file(args.manifest)
-        sys.exit(0 if success else 1)
-
+    sys.exit(0 if (validate_dataset_file(args.file) if args.file else validate_manifest_file(args.manifest)) else 1)

@@ -1,405 +1,189 @@
-
-"""
-Earth Echo — Grid Generation and Schema v1.1 JSON Exporter
-
-Modules 5, 6 & 8:
-- Downsample preprocessed imagery to a 64 x 32 grid.
-- Apply shared linear normalization across observations.
-- Preserve masked pixels as JSON null values.
-- Export Schema v1.1 datasets with multiple frames.
-- Register generated datasets in public/data/manifest.json.
-
-Note:
-Night Lights values are extracted from rendered NASA visualization
-images. They are not calibrated satellite radiance measurements.
-"""
-
-import os
-import sys
-import json
+"""Earth Echo: NASA visualization-derived brightness grids (Schema v1.1)."""
 import argparse
+import hashlib
+import json
+import os
+import tempfile
+from pathlib import Path
 
 import numpy as np
-
 from process_image import preprocess_and_extract_luminance
 
-
-TARGET_WIDTH = 64
-TARGET_HEIGHT = 32
-
-SOURCE_MIN = 0.0
-SOURCE_MAX = 255.0
+TARGET_WIDTH, TARGET_HEIGHT = 64, 32
+SOURCE_MIN, SOURCE_MAX = 0.0, 255.0
+PUBLIC = Path('public').resolve()
 
 
-def area_downsample_to_grid(
-    luma_matrix: np.ndarray,
-    target_w: int = TARGET_WIDTH,
-    target_h: int = TARGET_HEIGHT
-) -> list:
-    """
-    Downsample a 2D luminance array using block averaging.
-
-    Valid pixels in each block are averaged.
-    Fully masked blocks become None (JSON null).
-
-    This is block averaging, not fractional-pixel area weighting.
-    """
-
-    if luma_matrix.ndim != 2:
-        raise ValueError("Expected a 2D luminance matrix.")
-
-    orig_h, orig_w = luma_matrix.shape
-
-    if orig_h < target_h or orig_w < target_w:
-        raise ValueError(
-            "Input image must be at least as large as the target grid."
-        )
-
-    row_step = orig_h / target_h
-    col_step = orig_w / target_w
-
+def block_average_to_grid(luma_matrix, target_w=TARGET_WIDTH, target_h=TARGET_HEIGHT):
+    if not isinstance(luma_matrix, np.ndarray) or luma_matrix.ndim != 2:
+        raise ValueError('Expected a 2D NumPy array')
+    height, width = luma_matrix.shape
+    if target_w <= 0 or target_h <= 0 or height < target_h or width < target_w:
+        raise ValueError('Invalid target grid or input image dimensions')
     grid = []
-
-    for ty in range(target_h):
+    for y in range(target_h):
         row = []
-
-        y0 = int(ty * row_step)
-        y1 = int((ty + 1) * row_step)
-        y1 = max(y1, y0 + 1)
-
-        for tx in range(target_w):
-            x0 = int(tx * col_step)
-            x1 = int((tx + 1) * col_step)
-            x1 = max(x1, x0 + 1)
-
-            block = luma_matrix[y0:y1, x0:x1]
-
-            valid_pixels = block[np.isfinite(block)]
-
-            if valid_pixels.size == 0:
+        y0, y1 = int(y * height / target_h), int((y + 1) * height / target_h)
+        for x in range(target_w):
+            x0, x1 = int(x * width / target_w), int((x + 1) * width / target_w)
+            pixels = luma_matrix[y0:y1, x0:x1]
+            valid = pixels[np.isfinite(pixels)]
+            if valid.size == 0:
                 row.append(None)
             else:
-                mean_luma = float(np.mean(valid_pixels))
-
-                norm_val = (
-                    (mean_luma - SOURCE_MIN)
-                    / (SOURCE_MAX - SOURCE_MIN)
-                )
-
-                clamped = max(0.0, min(1.0, norm_val))
-
-                row.append(round(clamped, 4))
-
+                mean = float(np.mean(valid))
+                if not SOURCE_MIN <= mean <= SOURCE_MAX:
+                    raise ValueError(f'Display-luma value outside {SOURCE_MIN}–{SOURCE_MAX}')
+                row.append(round((mean - SOURCE_MIN) / (SOURCE_MAX - SOURCE_MIN), 4))
         grid.append(row)
-
-    assert len(grid) == target_h
-    assert all(len(row) == target_w for row in grid)
-
     return grid
 
 
-def update_manifest(
-    dataset_id: str,
-    file_path: str,
-    label: str,
-    group: str = "night_lights"
-):
-    """
-    Register a generated dataset in the Schema v1.1 manifest.
-
-    Existing entries are preserved.
-    An entry with the same dataset ID is replaced.
-    """
-
-    manifest_path = os.path.join(
-        "public", "data", "manifest.json"
-    )
-
-    manifest = {
-        "schema_version": "1.1",
-        "datasets": []
-    }
-
-    if os.path.exists(manifest_path):
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-
-    if not isinstance(manifest, dict):
-        raise ValueError("Manifest must be a JSON object.")
-
-    if not isinstance(manifest.get("datasets", []), list):
-        raise ValueError("Manifest datasets must be a list.")
-
-    manifest["schema_version"] = "1.1"
-
-    web_path = file_path.replace("\\", "/")
-
-    if web_path.startswith("public/"):
-        web_path = web_path[len("public"):]
-
-    if not web_path.startswith("/"):
-        web_path = "/" + web_path
-
-    manifest["datasets"] = [
-        entry
-        for entry in manifest.get("datasets", [])
-        if entry.get("id") != dataset_id
-    ]
-
-    manifest["datasets"].append({
-        "id": dataset_id,
-        "path": web_path,
-        "label": label,
-        "comparison_group": group
-    })
-
-    os.makedirs(
-        os.path.dirname(manifest_path),
-        exist_ok=True
-    )
-
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
-
-    print(
-        f"[Manifest Updated] {manifest_path} "
-        f"(Total registered datasets: "
-        f"{len(manifest['datasets'])})"
-    )
+def atomic_json_write(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         prefix='.earth_echo_', suffix='.tmp', delete=False) as file:
+            temp_name = file.name
+            json.dump(data, file, indent=2, ensure_ascii=False, allow_nan=False)
+            file.write('\n')
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
-def build_schema_v11_dataset(
-    dataset_id: str,
-    title: str,
-    frames_data: list,
-    source_url: str = "https://svs.gsfc.nasa.gov/5313/",
-    attribution: str = (
-        "Visualization by Kel Elkins (NASA SVS), using "
-        "Suomi NPP VIIRS Black Marble data courtesy of "
-        "Miguel Román and the NASA Black Marble Science Team."
-    ),
-    description: str = (
-        "Global nighttime illumination visualization "
-        "comparing 2012 and 2023 from the NASA "
-        "Earth Information Center."
-    )
-) -> dict:
-    """
-    Build a Schema v1.1 dataset.
+def public_web_path(path):
+    resolved = Path(path).resolve()
+    try:
+        relative = resolved.relative_to(PUBLIC)
+    except ValueError as exc:
+        raise ValueError('Dataset output must be inside public/') from exc
+    if not resolved.is_file() or resolved.suffix.lower() != '.json':
+        raise ValueError('Dataset output must be an existing JSON file')
+    return '/' + relative.as_posix()
 
-    Geographic registration has not been verified.
-    The projection field is therefore a descriptive placeholder.
-    """
 
+def update_manifest(dataset_id, file_path, label, group='night_lights'):
+    manifest_path = PUBLIC / 'data' / 'manifest.json'
+    manifest = {'schema_version': '1.1', 'datasets': []}
+    if manifest_path.exists():
+        with manifest_path.open(encoding='utf-8') as file:
+            manifest = json.load(file)
+    if not isinstance(manifest, dict) or manifest.get('schema_version') != '1.1':
+        raise ValueError('Manifest must be a Schema v1.1 object')
+    entries = manifest.get('datasets')
+    if not isinstance(entries, list):
+        raise ValueError('Manifest datasets must be a list')
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or any(not isinstance(entry.get(k), str) or not entry[k].strip()
+                                             for k in ('id', 'path', 'label', 'comparison_group')):
+            raise ValueError('Malformed manifest entry')
+        if entry['id'] in seen:
+            raise ValueError(f'Duplicate manifest dataset ID: {entry["id"]}')
+        seen.add(entry['id'])
+    web_path = public_web_path(file_path)
+    manifest['datasets'] = [entry for entry in entries if entry['id'] != dataset_id]
+    manifest['datasets'].append({'id': dataset_id, 'path': web_path,
+                                 'label': label, 'comparison_group': group})
+    atomic_json_write(manifest_path, manifest)
+    print(f'[Manifest Updated] {manifest_path}')
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_schema_v11_dataset(dataset_id, title, frames_data,
+                             source_url='https://svs.gsfc.nasa.gov/5313/',
+                             attribution='NASA Scientific Visualization Studio; source asset attribution must be verified.',
+                             description='NASA Night Lights 2012–2023 visualization-derived brightness comparison.',
+                             processing_inputs=None):
     return {
-        "schema_version": "1.1",
-
-        "id": dataset_id,
-        "title": title,
-
-        "source": {
-            "organization": (
-                "NASA Goddard Space Flight Center / "
-                "Scientific Visualization Studio"
-            ),
-            "url": source_url,
-            "attribution": attribution,
-            "disclaimer": (
-                "Visualization-derived brightness index; "
-                "not calibrated satellite radiance."
-            )
+        'schema_version': '1.1', 'id': dataset_id, 'title': title,
+        'source': {
+            'organization': 'NASA Goddard Space Flight Center / Scientific Visualization Studio',
+            'url': source_url, 'attribution': attribution,
+            'disclaimer': 'Visualization-derived display-luma index; not calibrated satellite radiance.'
         },
-
-        "width": TARGET_WIDTH,
-        "height": TARGET_HEIGHT,
-
-        "projection": "image_grid_unverified",
-
-        "description": description,
-
-        "channels": [
-            {
-                "id": "brightness",
-                "name": "Visualization Brightness Index",
-                "type": "image_derived_index",
-                "unit": None,
-                "range": [0.0, 1.0],
-                "description": (
-                    "BT.709-weighted RGB display luma "
-                    "extracted from NASA visualization frames. "
-                    "Includes rendered geographic features; "
-                    "not calibrated satellite radiance."
-                )
-            }
-        ],
-
-        "normalization": {
-            "method": "shared_linear",
-            "source_min": SOURCE_MIN,
-            "source_max": SOURCE_MAX
-        },
-
-        "sonification_profile": {
-            "default_channel": "brightness",
-            "scale": "pentatonic_major",
-            "base_frequency": 220,
-
-            "pitch_mapping": {
-                "channel": "brightness",
-                "min_hz": 110,
-                "max_hz": 880,
-                "curve": "exponential"
-            },
-
-            "spatial_mapping": {
-                "mode": "stereo_pan",
-                "x_axis": "pan_left_to_right",
-                "y_axis": "timbre_filter"
-            },
-
-            "legend": {
-                "pitch": (
-                    "Higher pitch represents a higher "
-                    "visualization-derived brightness index, "
-                    "not measured nighttime radiance."
-                ),
-
-                "stereo": (
-                    "Left-to-right stereo panning corresponds "
-                    "to horizontal position in the extracted "
-                    "image grid."
-                ),
-
-                "silence": (
-                    "Silent cells represent missing grid values, "
-                    "currently caused by the top and bottom "
-                    "image-row masks."
-                )
+        'width': TARGET_WIDTH, 'height': TARGET_HEIGHT,
+        'projection': 'image_grid_unverified', 'description': description,
+        'channels': [{
+            'id': 'brightness', 'name': 'Visualization Brightness Index',
+            'type': 'image_derived_index', 'unit': None, 'range': [0.0, 1.0],
+            'description': 'BT.709-weighted display luma from rendered NASA imagery; includes background graphics.'
+        }],
+        'normalization': {'method': 'shared_linear', 'source_min': SOURCE_MIN, 'source_max': SOURCE_MAX},
+        'sonification_profile': {
+            'default_channel': 'brightness', 'scale': 'pentatonic_major', 'base_frequency': 220,
+            'pitch_mapping': {'channel': 'brightness', 'min_hz': 110, 'max_hz': 880, 'curve': 'exponential'},
+            'spatial_mapping': {'mode': 'stereo_pan', 'x_axis': 'pan_left_to_right', 'y_axis': 'timbre_filter'},
+            'legend': {
+                'pitch': 'Higher pitch indicates higher visualization-derived brightness, not measured radiance.',
+                'stereo': 'Horizontal image-grid position controls stereo panning.',
+                'silence': 'Missing or invalid cells are silent; missing is not zero brightness.'
             }
         },
-
-        "frames": frames_data
+        'processing': {
+            'method': 'block_average_to_grid', 'input_type': 'rendered_visualization',
+            'display_luma': 'BT.709 weighted gamma-encoded RGB',
+            'polar_mask_percent': 0.0, 'crop_margins_in_this_step': [0, 0, 0, 0],
+            'geographic_alignment': 'visually_checked_not_georeferenced',
+            'input_files': processing_inputs or [],
+            'note': 'Input checksums cover cropped PNGs, not original NASA downloads. Verify source provenance separately.'
+        },
+        'frames': frames_data
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Generate a 64x32 Schema v1.1 dataset "
-            "from preprocessed imagery."
-        )
-    )
-
-    parser.add_argument(
-        "--id",
-        type=str,
-        default="night_lights_2012_2023"
-    )
-
-    parser.add_argument(
-        "--title",
-        type=str,
-        default="NASA Night Lights 2012–2023"
-    )
-
-    parser.add_argument(
-        "--inputs",
-        nargs="+",
-        required=True,
-        help="Input image file paths"
-    )
-
-    parser.add_argument(
-        "--labels",
-        nargs="+",
-        required=True
-    )
-
-    parser.add_argument(
-        "--timestamps",
-        nargs="+",
-        required=True
-    )
-
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="public/data/night_lights_2012_2023.json"
-    )
-
-    parser.add_argument(
-        "--group",
-        type=str,
-        default="night_lights"
-    )
-
+    parser = argparse.ArgumentParser(description='Generate Schema v1.1 brightness dataset')
+    parser.add_argument('--id', default='night_lights_2012_2023')
+    parser.add_argument('--title', default='NASA Night Lights 2012–2023')
+    parser.add_argument('--inputs', nargs='+', required=True)
+    parser.add_argument('--labels', nargs='+', required=True)
+    parser.add_argument('--timestamps', nargs='+', required=True)
+    parser.add_argument('--output', default='public/data/night_lights_2012_2023.json')
+    parser.add_argument('--group', default='night_lights')
+    parser.add_argument('--source-url', default='https://svs.gsfc.nasa.gov/5313/')
+    parser.add_argument('--no-manifest', action='store_true', help='Do not change manifest (recommended for test output)')
     args = parser.parse_args()
-
-    if not (
-        len(args.inputs)
-        == len(args.labels)
-        == len(args.timestamps)
-    ):
-        parser.error(
-            "--inputs, --labels and --timestamps "
-            "must have matching lengths."
-        )
-
-    frames = []
-
-    for idx, (img_path, label, timestamp) in enumerate(
-        zip(args.inputs, args.labels, args.timestamps)
-    ):
-        print(
-            f"\nProcessing Frame [{idx}] "
-            f"({label}, {timestamp}) from {img_path}"
-        )
-
-        luma = preprocess_and_extract_luminance(img_path)
-
-        grid = area_downsample_to_grid(luma)
-
-        frames.append({
-            "frame_index": idx,
-            "label": label,
-            "timestamp": timestamp,
-            "values": {
-                "brightness": grid
-            }
-        })
-
-    dataset = build_schema_v11_dataset(
-        dataset_id=args.id,
-        title=args.title,
-        frames_data=frames
-    )
-
-    output_dir = os.path.dirname(args.output)
-
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(
-            dataset,
-            f,
-            indent=2,
-            ensure_ascii=False,
-            allow_nan=False
-        )
-
-    print(
-        f"\n[Export Success] "
-        f"Wrote Schema v1.1 dataset to {args.output}"
-    )
-
-    update_manifest(
-        args.id,
-        args.output,
-        args.title,
-        args.group
-    )
+    if not args.inputs or len(args.inputs) != len(args.labels) or len(args.inputs) != len(args.timestamps):
+        parser.error('--inputs, --labels and --timestamps must have matching nonzero lengths')
+    frames, inputs = [], []
+    for index, (path, label, timestamp) in enumerate(zip(args.inputs, args.labels, args.timestamps)):
+        if not label.strip() or not timestamp.strip():
+            parser.error('Frame labels and timestamps must not be empty')
+        print(f'[Processing] {label}: {path}')
+        luma = preprocess_and_extract_luminance(path, mask_polar_rows_percent=0.0)
+        frames.append({'frame_index': index, 'label': label, 'timestamp': timestamp,
+                       'values': {'brightness': block_average_to_grid(luma)}})
+        inputs.append({'filename': Path(path).name, 'sha256': sha256(path),
+                       'size_bytes': Path(path).stat().st_size,
+                       'width': int(luma.shape[1]), 'height': int(luma.shape[0])})
+    dataset = build_schema_v11_dataset(args.id, args.title, frames, args.source_url,
+                                      processing_inputs=inputs)
+    # Check output before writing. Never change production JSON during a test unless explicitly requested.
+    output = Path(args.output)
+    if not args.no_manifest:
+        try:
+            output.resolve().relative_to(PUBLIC)
+        except ValueError:
+            parser.error('Manifest registration requires output inside public/; use --no-manifest for test output')
+    atomic_json_write(output, dataset)
+    print(f'[Export Success] {output}')
+    if not args.no_manifest:
+        update_manifest(args.id, str(output), args.title, args.group)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
