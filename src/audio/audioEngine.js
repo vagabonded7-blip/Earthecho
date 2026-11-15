@@ -20,6 +20,11 @@ let masterGain = null;
 let masterVolume = DEFAULT_MASTER_VOLUME;
 let activePlaybackSession = null;
 const activeVoices = new Set();
+let audioAnalyser = null;
+
+export function getAudioAnalyser() {
+  return audioAnalyser;
+}
 
 function getAudioContextConstructor() {
   return globalThis.AudioContext || globalThis.webkitAudioContext || null;
@@ -136,7 +141,8 @@ function scheduleTone(tone, startTime = audioContext.currentTime) {
     voice.gain = gain;
     voice.gainCreated = true;
 
-    const peakGain = (MAX_COMBINED_VOICE_GAIN / MAX_VOICES) * tone.velocity;
+    const voiceHeadroom = MAX_COMBINED_VOICE_GAIN / Math.sqrt(Math.max(1, activeVoices.size + 1));
+    const peakGain = Math.min(0.65, voiceHeadroom * Math.max(0.4, tone.velocity));
     const noteOnTime = scheduledStart + VOICE_ATTACK_SECONDS;
     const noteOffTime = noteOnTime + tone.durationSeconds;
     const releaseEndTime = noteOffTime + VOICE_RELEASE_SECONDS;
@@ -667,6 +673,13 @@ export async function initAudio() {
       gain.connect(context.destination);
       audioContext = context;
       masterGain = gain;
+      if (typeof context.createAnalyser === 'function') {
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.8;
+        gain.connect(analyser);
+        audioAnalyser = analyser;
+      }
     } catch (error) {
       if (context && context.state !== 'closed' && typeof context.close === 'function') {
         try {
