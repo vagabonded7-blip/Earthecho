@@ -15,7 +15,13 @@ import {
   SCENARIO_PROFILES,
   getDatasetScenario,
   setActiveScenario,
-  getActiveScenario
+  getActiveScenario,
+  selectDatasetPreset,
+  playLocation,
+  playComparison,
+  generateAudioFingerprint,
+  playFingerprint,
+  stopPlayback
 } from '../src/audio/audioEngine.js';
 
 test('audio presets catalog exposes scientific, ambient, and cinematic styles', () => {
@@ -145,5 +151,87 @@ test('dataset scenario detection automatically categorizes environmental dataset
 
   setActiveScenario('night_lights');
   assert.equal(getActiveScenario(), 'night_lights');
+});
+
+test('SCENARIO_PROFILES includes atmospheric temperature configuration', () => {
+  assert.ok(SCENARIO_PROFILES.temperature);
+  assert.equal(SCENARIO_PROFILES.temperature.genre, 'Atmospheric / Warm Synth');
+  assert.equal(SCENARIO_PROFILES.temperature.waveform, 'triangle');
+  assert.equal(SCENARIO_PROFILES.temperature.periodicWaveKey, 'atmospheric_temperature');
+});
+
+test('selectDatasetPreset switches active scenario preset dynamically', () => {
+  const nl = selectDatasetPreset('night_lights_2012_2023');
+  assert.equal(nl.scenario, 'night_lights');
+  assert.equal(getActiveScenario(), 'night_lights');
+
+  const oc = selectDatasetPreset('sea_surface_temp');
+  assert.equal(oc.scenario, 'ocean');
+  assert.equal(getActiveScenario(), 'ocean');
+
+  const vg = selectDatasetPreset('vegetation_ndvi_2020_2023');
+  assert.equal(vg.scenario, 'vegetation');
+  assert.equal(getActiveScenario(), 'vegetation');
+
+  const tp = selectDatasetPreset('land_surface_temp');
+  assert.equal(tp.scenario, 'temperature');
+  assert.equal(getActiveScenario(), 'temperature');
+});
+
+test('generateAudioFingerprint produces deterministic reproducible motifs', () => {
+  const mockDataset = {
+    schema_version: '1.1',
+    id: 'night_lights_2012_2023',
+    width: 4,
+    height: 4,
+    channels: [{ id: 'radiance', label: 'Radiance', quantity_type: 'scalar', normalization: { source_min: 0, source_max: 1 } }],
+    frames: [
+      {
+        timestamp: '2023-01-01T00:00:00Z',
+        values: {
+          radiance: [
+            [0.1, 0.2, 0.3, 0.4],
+            [0.2, 0.5, 0.7, 0.3],
+            [0.4, 0.8, 0.9, 0.2],
+            [0.1, 0.3, 0.2, 0.1]
+          ]
+        }
+      }
+    ]
+  };
+
+  const loc1 = { lat: 37.77, lon: -122.41 };
+  const fp1 = generateAudioFingerprint(mockDataset, loc1, 0);
+  const fp2 = generateAudioFingerprint(mockDataset, loc1, 0);
+
+  // Determinism
+  assert.equal(fp1.id, fp2.id);
+  assert.equal(fp1.scenario, 'night_lights');
+  assert.equal(fp1.motif.length, 4);
+  assert.deepEqual(fp1.motif, fp2.motif);
+
+  // Different locations yield different fingerprints
+  const loc2 = { lat: 51.5, lon: 0.12 };
+  const fp3 = generateAudioFingerprint(mockDataset, loc2, 0);
+  assert.notEqual(fp1.id, fp3.id);
+
+  // Missing dataset throws
+  assert.throws(() => generateAudioFingerprint(null, loc1, 0), /dataset is required/);
+});
+
+test('playFingerprint validates input schema and motif presence', async () => {
+  await assert.rejects(() => playFingerprint(null), /valid fingerprint object/);
+  await assert.rejects(() => playFingerprint({}), /non-empty motif array/);
+  await assert.rejects(() => playFingerprint({ motif: [] }), /non-empty motif array/);
+});
+
+test('playLocation validates arguments and dataset presence', async () => {
+  await assert.rejects(() => playLocation(null), /selection must be an object/);
+  await assert.rejects(() => playLocation({}), /selection.dataset is required/);
+});
+
+test('stopPlayback is idempotent and resolves safely', async () => {
+  await assert.doesNotReject(() => stopPlayback());
+  await assert.doesNotReject(() => stopPlayback());
 });
 
