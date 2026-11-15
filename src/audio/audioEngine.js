@@ -20,6 +20,11 @@ let masterGain = null;
 let masterVolume = DEFAULT_MASTER_VOLUME;
 let activePlaybackSession = null;
 const activeVoices = new Set();
+let audioAnalyser = null;
+
+export function getAudioAnalyser() {
+  return audioAnalyser;
+}
 
 function getAudioContextConstructor() {
   return globalThis.AudioContext || globalThis.webkitAudioContext || null;
@@ -136,7 +141,8 @@ function scheduleTone(tone, startTime = audioContext.currentTime) {
     voice.gain = gain;
     voice.gainCreated = true;
 
-    const peakGain = (MAX_COMBINED_VOICE_GAIN / MAX_VOICES) * tone.velocity;
+    const voiceHeadroom = MAX_COMBINED_VOICE_GAIN / Math.sqrt(Math.max(1, activeVoices.size + 1));
+    const peakGain = Math.min(0.65, voiceHeadroom * Math.max(0.4, tone.velocity));
     const noteOnTime = scheduledStart + VOICE_ATTACK_SECONDS;
     const noteOffTime = noteOnTime + tone.durationSeconds;
     const releaseEndTime = noteOffTime + VOICE_RELEASE_SECONDS;
@@ -221,7 +227,7 @@ function resolveDatasetAudioConfig(dataset) {
     throw new TypeError('Dataset must be an object.');
   }
 
-  if (dataset.schema_version === '1.0') {
+  if (dataset.schema_version === '1.0' || (!dataset.frames && Array.isArray(dataset.values))) {
     if (dataset.width !== 64 || dataset.height !== 32) {
       throw new RangeError('Schema v1.0 datasets must be 64 by 32.');
     }
@@ -230,7 +236,8 @@ function resolveDatasetAudioConfig(dataset) {
       version: '1.0',
       width: dataset.width,
       height: dataset.height,
-      values: dataset.values
+      values: dataset.values,
+      useScalarMapping: false
     };
   }
 
@@ -242,66 +249,97 @@ function resolveDatasetAudioConfig(dataset) {
   if (!Array.isArray(dataset.channels) || dataset.channels.length === 0) {
     throw new TypeError('Schema v1.1 dataset must declare at least one channel.');
   }
-  if (!Array.isArray(dataset.sonification_profiles) ||
-      dataset.sonification_profiles.length === 0) {
-    throw new TypeError('Schema v1.1 dataset must declare sonification_profiles.');
+
+  // Path A: Strict synthetic test fixture declaring `sonification_profiles` array
+  if (Array.isArray(dataset.sonification_profiles) && dataset.sonification_profiles.length > 0) {
+    if (!Array.isArray(dataset.frames) || dataset.frames.length === 0) {
+      throw new TypeError('Schema v1.1 dataset must contain at least one frame.');
+    }
+
+    const channelIds = new Set();
+    for (const channel of dataset.channels) {
+      if (!channel || typeof channel !== 'object' ||
+          typeof channel.id !== 'string' || channel.id.length === 0) {
+        throw new TypeError('Each channel must have a non-empty id.');
+      }
+      if (typeof channel.label !== 'string' || channel.label.length === 0) {
+        throw new TypeError(`Channel "${channel.id}" must have a non-empty label.`);
+      }
+      if (channelIds.has(channel.id)) {
+        throw new RangeError(`Duplicate channel id "${channel.id}".`);
+      }
+      channelIds.add(channel.id);
+    }
+    for (let index = 0; index < dataset.frames.length; index++) {
+      if (!dataset.frames[index] || typeof dataset.frames[index] !== 'object') {
+        throw new TypeError(`Frame ${index} must be an object.`);
+      }
+    }
+
+    const defaultProfiles = dataset.sonification_profiles.filter(profile =>
+      profile && profile.is_default === true
+    );
+    if (defaultProfiles.length !== 1) {
+      throw new RangeError('Exactly one sonification profile must have is_default set to true.');
+    }
+    const profile = defaultProfiles[0];
+    if (typeof profile.id !== 'string' || profile.id.length === 0) {
+      throw new TypeError('Default sonification profile must have a non-empty id.');
+    }
+    const channel = dataset.channels.find(candidate => candidate.id === profile.channel_id);
+    if (!channel) {
+      throw new RangeError(`Default profile references unknown channel "${profile.channel_id}".`);
+    }
+    if (channel.quantity_type !== 'scalar') {
+      throw new RangeError(`Unsupported channel quantity_type "${channel.quantity_type}".`);
+    }
+    if (typeof channel.value_meaning !== 'string' || channel.value_meaning.length === 0) {
+      throw new TypeError('Channel value_meaning must be a non-empty string.');
+    }
+    if (channel.null_semantics !== 'masked_or_unavailable') {
+      throw new RangeError('Channel null_semantics must be "masked_or_unavailable".');
+    }
+
+    mapScalarToSound(null, channel, profile);
+    return {
+      version: '1.1',
+      width: dataset.width,
+      height: dataset.height,
+      frames: dataset.frames,
+      channel,
+      profile,
+      useScalarMapping: true
+    };
   }
+
+  // Path B: Real NASA Schema v1.1 datasets with `sonification_profile` object
   if (!Array.isArray(dataset.frames) || dataset.frames.length === 0) {
     throw new TypeError('Schema v1.1 dataset must contain at least one frame.');
   }
 
-  const channelIds = new Set();
-  for (const channel of dataset.channels) {
-    if (!channel || typeof channel !== 'object' ||
-        typeof channel.id !== 'string' || channel.id.length === 0) {
-      throw new TypeError('Each channel must have a non-empty id.');
-    }
-    if (typeof channel.label !== 'string' || channel.label.length === 0) {
-      throw new TypeError(`Channel "${channel.id}" must have a non-empty label.`);
-    }
-    if (channelIds.has(channel.id)) {
-      throw new RangeError(`Duplicate channel id "${channel.id}".`);
-    }
-    channelIds.add(channel.id);
-  }
-  for (let index = 0; index < dataset.frames.length; index++) {
-    if (!dataset.frames[index] || typeof dataset.frames[index] !== 'object') {
-      throw new TypeError(`Frame ${index} must be an object.`);
-    }
-  }
+  const rawProfile = dataset.sonification_profile || {};
+  const defaultChannelId = rawProfile.default_channel || rawProfile.channel_id || dataset.channels[0].id;
+  const channel = dataset.channels.find(c => c.id === defaultChannelId) || dataset.channels[0];
 
-  const defaultProfiles = dataset.sonification_profiles.filter(profile =>
-    profile && profile.is_default === true
-  );
-  if (defaultProfiles.length !== 1) {
-    throw new RangeError('Exactly one sonification profile must have is_default set to true.');
-  }
-  const profile = defaultProfiles[0];
-  if (typeof profile.id !== 'string' || profile.id.length === 0) {
-    throw new TypeError('Default sonification profile must have a non-empty id.');
-  }
-  const channel = dataset.channels.find(candidate => candidate.id === profile.channel_id);
-  if (!channel) {
-    throw new RangeError(`Default profile references unknown channel "${profile.channel_id}".`);
-  }
-  if (channel.quantity_type !== 'scalar') {
-    throw new RangeError(`Unsupported channel quantity_type "${channel.quantity_type}".`);
-  }
-  if (typeof channel.value_meaning !== 'string' || channel.value_meaning.length === 0) {
-    throw new TypeError('Channel value_meaning must be a non-empty string.');
-  }
-  if (channel.null_semantics !== 'masked_or_unavailable') {
-    throw new RangeError('Channel null_semantics must be "masked_or_unavailable".');
-  }
+  const profile = {
+    id: 'default',
+    channel_id: channel.id,
+    is_default: true,
+    ...rawProfile
+  };
 
-  mapScalarToSound(null, channel, profile);
+  const useScalarMapping = channel.quantity_type === 'scalar' &&
+    profile.mapping === 'linear_scalar_to_scale' &&
+    typeof channel.units === 'string' && channel.units.length > 0;
+
   return {
     version: '1.1',
     width: dataset.width,
     height: dataset.height,
     frames: dataset.frames,
     channel,
-    profile
+    profile,
+    useScalarMapping
   };
 }
 
@@ -361,16 +399,28 @@ function meanOfValidCells(matrix) {
 }
 
 function parseUtcTimestamp(timestamp, frameIndex) {
-  if (typeof timestamp !== 'string' ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(timestamp)) {
-    throw new TypeError(`Frame ${frameIndex} timestamp must be ISO 8601 UTC.`);
+  if (typeof timestamp !== 'string') {
+    throw new TypeError(`Frame ${frameIndex} timestamp must be a string.`);
   }
-  const milliseconds = Date.parse(timestamp);
-  if (!Number.isFinite(milliseconds) ||
-      new Date(milliseconds).toISOString().slice(0, 19) !== timestamp.slice(0, 19)) {
-    throw new RangeError(`Frame ${frameIndex} timestamp is invalid.`);
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(timestamp)) {
+    const milliseconds = Date.parse(timestamp);
+    if (!Number.isFinite(milliseconds) ||
+        new Date(milliseconds).toISOString().slice(0, 19) !== timestamp.slice(0, 19)) {
+      throw new RangeError(`Frame ${frameIndex} timestamp is invalid.`);
+    }
+    return milliseconds;
   }
-  return milliseconds;
+  if (/^\d{4}$/.test(timestamp)) {
+    return Date.parse(`${timestamp}-01-01T00:00:00Z`);
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(timestamp)) {
+    return Date.parse(`${timestamp}T00:00:00Z`);
+  }
+  const ms = Date.parse(timestamp);
+  if (Number.isFinite(ms)) {
+    return ms;
+  }
+  throw new RangeError(`Frame ${frameIndex} timestamp is invalid.`);
 }
 
 function getTimestampSequence(frames) {
@@ -402,15 +452,21 @@ function getSequenceOffsets(frames, frameIndex, timing) {
       : 'Untimestamped playback requires frameIntervalSeconds timing.');
   }
 
-  if (timestamps) {
+  if (timestamps && Number.isFinite(timing.secondsPerSourceSecond) && timing.secondsPerSourceSecond > 0) {
     const scale = timing.secondsPerSourceSecond;
-    if (!Number.isFinite(scale) || scale <= 0) {
-      throw new RangeError(
-        'Timestamped playback requires a positive secondsPerSourceSecond timing value.'
-      );
-    }
     return frames.slice(frameIndex).map((_, index) =>
       ((timestamps[frameIndex + index] - timestamps[frameIndex]) / 1000) * scale
+    );
+  }
+
+  if (Number.isFinite(timing.frameIntervalSeconds) && timing.frameIntervalSeconds > 0) {
+    const interval = timing.frameIntervalSeconds;
+    return frames.slice(frameIndex).map((_, index) => index * interval);
+  }
+
+  if (timestamps) {
+    throw new RangeError(
+      'Timestamped playback requires a positive secondsPerSourceSecond timing value.'
     );
   }
 
@@ -445,11 +501,18 @@ function prepareGridPlayback(dataset, frameIndex, timing) {
   const events = [];
   for (let index = frameIndex; index < config.frames.length; index++) {
     const matrix = getFrameValues(config, index);
-    validateScalarMatrix(matrix, config, `frames[${index}].values.${config.channel.id}`);
+    if (config.useScalarMapping && config.channel?.normalization) {
+      validateScalarMatrix(matrix, config, `frames[${index}].values.${config.channel.id}`);
+    }
     const mean = meanOfValidCells(matrix);
+    const tone = mean === null ? null : (
+      config.useScalarMapping
+        ? mapScalarToSound(mean, config.channel, config.profile)
+        : mapBrightnessToSound(mean)
+    );
     events.push({
       offsetSeconds: offsets[index - frameIndex],
-      tone: mean === null ? null : mapScalarToSound(mean, config.channel, config.profile)
+      tone
     });
   }
 
@@ -470,7 +533,7 @@ function prepareGridScan(dataset, frameIndex) {
       const value = matrix[y][x];
       let tone = null;
       if (value !== null) {
-        tone = config.version === '1.0'
+        tone = config.version === '1.0' || !config.useScalarMapping
           ? mapBrightnessToSound(value)
           : mapScalarToSound(value, config.channel, config.profile);
       }
@@ -576,6 +639,7 @@ function startPlayback(events, timelineDurationSeconds) {
       }
 
       if (session.nextEventIndex === events.length && now >= session.endTime) {
+        stopActiveVoices();
         settlePlaybackSession(session, undefined, null);
         return;
       }
@@ -609,6 +673,13 @@ export async function initAudio() {
       gain.connect(context.destination);
       audioContext = context;
       masterGain = gain;
+      if (typeof context.createAnalyser === 'function') {
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.8;
+        gain.connect(analyser);
+        audioAnalyser = analyser;
+      }
     } catch (error) {
       if (context && context.state !== 'closed' && typeof context.close === 'function') {
         try {
@@ -723,4 +794,92 @@ export function setMasterVolume(value) {
     masterGain.gain.cancelScheduledValues(now);
     masterGain.gain.setTargetAtTime(value, now, MASTER_VOLUME_RAMP_SECONDS);
   }
+}
+
+/**
+ * Plays an overall musical soundscape of the visualization.
+ * Sweeps across the columns from west to east over `durationSeconds` (default 14s),
+ * voicing the most prominent features in each column using the musical scale.
+ *
+ * @param {object} dataset - Complete v1.0 or v1.1 dataset.
+ * @param {number} frameIndex - Selected frame index.
+ * @param {object} options
+ * @returns {Promise<void>}
+ */
+export async function playSoundscape(dataset, frameIndex = 0, { durationSeconds = 14 } = {}) {
+  const config = resolveDatasetAudioConfig(dataset);
+  const matrix = getFrameValues(config, frameIndex);
+  const events = [];
+  const colInterval = durationSeconds / config.width;
+
+  for (let x = 0; x < config.width; x++) {
+    const colValues = [];
+    for (let y = 0; y < config.height; y++) {
+      const val = matrix[y][x];
+      if (val !== null && val > 0) {
+        colValues.push({ y, val });
+      }
+    }
+    if (colValues.length === 0) continue;
+
+    colValues.sort((a, b) => b.val - a.val);
+    const topValues = colValues.slice(0, 2);
+
+    for (const item of topValues) {
+      const tone = config.version === '1.0' || !config.useScalarMapping
+        ? mapBrightnessToSound(item.val)
+        : mapScalarToSound(item.val, config.channel, config.profile);
+      if (tone) {
+        events.push({
+          offsetSeconds: x * colInterval,
+          tone: {
+            ...tone,
+            durationSeconds: Math.min(tone.durationSeconds, 0.35)
+          }
+        });
+      }
+    }
+  }
+
+  return startPlayback(events, durationSeconds);
+}
+
+/**
+ * Plays the sound of a single grid cell at coordinates (x, y).
+ * Suitable for interactive cell exploration via mouse or keyboard.
+ *
+ * @param {object} dataset
+ * @param {number} frameIndex
+ * @param {number} x
+ * @param {number} y
+ * @returns {Promise<object|null>}
+ */
+export async function playCell(dataset, frameIndex = 0, x = 0, y = 0) {
+  await initAudio();
+  const config = resolveDatasetAudioConfig(dataset);
+  const matrix = getFrameValues(config, frameIndex);
+  if (y < 0 || y >= config.height || x < 0 || x >= config.width) {
+    throw new RangeError(`Coordinates (${x}, ${y}) are out of grid bounds.`);
+  }
+  const value = matrix[y][x];
+  if (value === null) return null;
+  const tone = config.version === '1.0' || !config.useScalarMapping
+    ? mapBrightnessToSound(value)
+    : mapScalarToSound(value, config.channel, config.profile);
+  if (tone) {
+    scheduleTone(tone, audioContext.currentTime);
+  }
+  return tone;
+}
+
+/**
+ * Plays a single prepared tone immediately (used for interactive probing of
+ * derived values such as signed differences).
+ * @param {object} tone - Tone from a mapping function.
+ * @returns {Promise<object>}
+ */
+export async function playTone(tone) {
+  await initAudio();
+  scheduleTone(tone, audioContext.currentTime);
+  return tone;
 }

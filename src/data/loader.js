@@ -1,4 +1,4 @@
-import { EXPECTED_SCHEMA_VERSION, validateDataset } from './schema.js';
+import { EXPECTED_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, validateDataset, getFrameChannelValues } from './schema.js';
 
 const MANIFEST_PATH = '/data/manifest.json';
 const DATASET_PATH_PATTERN = /^\/data\/[a-zA-Z0-9_-]+\.json$/;
@@ -26,10 +26,10 @@ export async function loadManifest({ signal, fetcher = fetch } = {}) {
   const manifest = await fetchJSON(MANIFEST_PATH, 'the dataset manifest', { signal, fetcher });
   if (
     !manifest ||
-    manifest.schema_version !== EXPECTED_SCHEMA_VERSION ||
+    !SUPPORTED_SCHEMA_VERSIONS.includes(manifest.schema_version) ||
     !Array.isArray(manifest.datasets)
   ) {
-    throw new Error('The dataset manifest does not match schema version 1.0.');
+    throw new Error('The dataset manifest does not match schema version 1.0 or 1.1.');
   }
 
   const ids = new Set();
@@ -80,6 +80,15 @@ export async function loadDataset(entry, { signal, fetcher = fetch } = {}) {
   }
   if (dataset.id !== entry.id) {
     throw new Error(`"${label}" has id "${dataset.id}", but the manifest expects "${entry.id}".`);
+  }
+
+  // Ensure dataset.values is accessible for callers expecting top-level 2D grid
+  if (!dataset.values && dataset.frames?.[0]) {
+    try {
+      dataset.values = getFrameChannelValues(dataset, 0);
+    } catch {
+      // ignore
+    }
   }
 
   return dataset;
