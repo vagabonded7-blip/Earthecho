@@ -15,19 +15,239 @@ const SCHEDULER_POLL_INTERVAL_MS = 10;
 const SCAN_CELL_INTERVAL_SECONDS = 0.12;
 const ALLOWED_WAVEFORMS = new Set(['sine', 'triangle', 'square', 'sawtooth']);
 
+/**
+ * Selectable Musical & Sonification Presets
+ * Each preset defines acoustic envelope, filtering, spatial panning, and harmonic character,
+ * while ensuring environmental data remains the primary driver of pitch, timing, and amplitude.
+ */
+export const AUDIO_PRESETS = Object.freeze({
+  scientific: {
+    id: 'scientific',
+    name: 'Scientific',
+    description: 'Clear, minimal data-to-sound representation with pure waveforms.',
+    waveform: 'sine',
+    attackSeconds: 0.02,
+    releaseSeconds: 0.08,
+    releaseLevel: 0.85,
+    gainBoost: 1.0,
+    useFilter: false,
+    useSpatialPanning: false,
+    harmonics: false
+  },
+  ambient: {
+    id: 'ambient',
+    name: 'Ambient',
+    description: 'Soft, atmospheric musical texture with warm timbres and smooth envelopes.',
+    waveform: 'triangle',
+    attackSeconds: 0.045,
+    releaseSeconds: 0.22,
+    releaseLevel: 0.72,
+    gainBoost: 1.25,
+    useFilter: true,
+    filterCutoffHz: 2600,
+    useSpatialPanning: true,
+    harmonics: true
+  },
+  cinematic: {
+    id: 'cinematic',
+    name: 'Cinematic',
+    description: 'Richer harmonies, dynamic spectral filtering, and spatial soundscape.',
+    waveform: 'triangle',
+    attackSeconds: 0.055,
+    releaseSeconds: 0.32,
+    releaseLevel: 0.65,
+    gainBoost: 1.35,
+    useFilter: true,
+    filterDynamic: true,
+    useSpatialPanning: true,
+    harmonics: true
+  }
+});
+
+/**
+ * Tailored Sonification Profiles for Specific Environmental Scenarios:
+ * 1. Night Lights — Electronic / Synth Music:
+ *    Snappy analog synthesizer waveforms, resonant dynamic filter sweeps, and energetic spatial panning.
+ * 2. Ocean — Ambient / Flowing Music:
+ *    Deep hydroacoustic warmth, gentle rolling swell envelopes, and atmospheric stereo currents.
+ * 3. Vegetation — Organic / Nature-Inspired Music:
+ *    Warm wooden marimba and bamboo kalimba acoustic transients with natural resonant decay.
+ */
+export const SCENARIO_PROFILES = Object.freeze({
+  night_lights: {
+    id: 'night_lights',
+    name: 'Night Lights (Electronic / Synth)',
+    genre: 'Electronic / Synth Music',
+    description: 'Crisp electronic synthesizer waveforms, dynamic resonant filter sweeps, and energetic spatial panning.',
+    waveform: 'sawtooth',
+    attackSeconds: 0.014,
+    releaseSeconds: 0.16,
+    releaseLevel: 0.70,
+    gainBoost: 1.30,
+    useFilter: true,
+    filterDynamic: true,
+    filterQ: 2.8,
+    maxCutoffHz: 4200,
+    useSpatialPanning: true,
+    periodicWaveKey: 'electronic_synth'
+  },
+  ocean: {
+    id: 'ocean',
+    name: 'Ocean (Ambient / Flowing)',
+    genre: 'Ambient / Flowing Music',
+    description: 'Deep hydroacoustic warmth, gentle rolling swell envelopes, and atmospheric stereo currents.',
+    waveform: 'sine',
+    attackSeconds: 0.075,
+    releaseSeconds: 0.44,
+    releaseLevel: 0.82,
+    gainBoost: 1.35,
+    useFilter: true,
+    filterDynamic: false,
+    filterCutoffHz: 1600,
+    filterQ: 0.85,
+    useSpatialPanning: true,
+    periodicWaveKey: 'ambient_flowing'
+  },
+  vegetation: {
+    id: 'vegetation',
+    name: 'Vegetation (Organic / Nature-Inspired)',
+    genre: 'Organic / Nature-Inspired Music',
+    description: 'Warm wooden marimba and bamboo kalimba acoustic transients with natural resonant decay.',
+    waveform: 'triangle',
+    attackSeconds: 0.007,
+    releaseSeconds: 0.28,
+    releaseLevel: 0.55,
+    gainBoost: 1.25,
+    useFilter: true,
+    filterDynamic: true,
+    filterQ: 1.6,
+    maxCutoffHz: 2600,
+    useSpatialPanning: true,
+    periodicWaveKey: 'organic_nature'
+  }
+});
+
+let currentPresetId = 'ambient';
+let activeScenarioId = 'night_lights';
+
+export function getDatasetScenario(dataset) {
+  if (!dataset) return 'night_lights';
+  const group = dataset.comparison_group?.toLowerCase() || '';
+  const id = dataset.id?.toLowerCase() || '';
+  const title = dataset.title?.toLowerCase() || '';
+
+  if (group.includes('ocean') || id.includes('ocean') || id.includes('sea') || title.includes('sea') || title.includes('ocean')) {
+    return 'ocean';
+  }
+  if (group.includes('veg') || id.includes('veg') || title.includes('veg') || title.includes('ndvi') || title.includes('forest')) {
+    return 'vegetation';
+  }
+  return 'night_lights';
+}
+
+export function setActiveScenario(scenarioId) {
+  if (typeof scenarioId !== 'string') return SCENARIO_PROFILES[activeScenarioId];
+  const s = scenarioId.toLowerCase();
+  if (s.includes('ocean') || s.includes('ambient') || s.includes('flow')) {
+    activeScenarioId = 'ocean';
+  } else if (s.includes('veg') || s.includes('organic') || s.includes('nature')) {
+    activeScenarioId = 'vegetation';
+  } else {
+    activeScenarioId = 'night_lights';
+  }
+  return SCENARIO_PROFILES[activeScenarioId];
+}
+
+export function getActiveScenario() {
+  return activeScenarioId;
+}
+
+export function getScenarioProfiles() {
+  return SCENARIO_PROFILES;
+}
+
 let audioContext = null;
 let masterGain = null;
+let masterCompressor = null;
 let masterVolume = DEFAULT_MASTER_VOLUME;
+let storedUnmutedVolume = DEFAULT_MASTER_VOLUME;
 let activePlaybackSession = null;
 const activeVoices = new Set();
 let audioAnalyser = null;
+const periodicWaveCache = new WeakMap();
 
 export function getAudioAnalyser() {
   return audioAnalyser;
 }
 
+export function setAudioPreset(presetId) {
+  if (typeof presetId !== 'string' || !AUDIO_PRESETS[presetId.toLowerCase()]) {
+    throw new RangeError(
+      `Unsupported audio preset "${presetId}". Available presets: ${Object.keys(AUDIO_PRESETS).join(', ')}.`
+    );
+  }
+  currentPresetId = presetId.toLowerCase();
+  return AUDIO_PRESETS[currentPresetId];
+}
+
+export function getAudioPreset() {
+  return currentPresetId;
+}
+
+export function getAvailableAudioPresets() {
+  return Object.values(AUDIO_PRESETS).map(({ id, name, description }) => ({
+    id,
+    name,
+    description
+  }));
+}
+
 function getAudioContextConstructor() {
   return globalThis.AudioContext || globalThis.webkitAudioContext || null;
+}
+
+function getPresetPeriodicWave(context, presetId) {
+  if (!context || typeof context.createPeriodicWave !== 'function') return null;
+
+  let contextCache = periodicWaveCache.get(context);
+  if (!contextCache) {
+    contextCache = new Map();
+    periodicWaveCache.set(context, contextCache);
+  }
+
+  if (contextCache.has(presetId)) {
+    return contextCache.get(presetId);
+  }
+
+  let wave = null;
+  try {
+    if (presetId === 'electronic_synth' || presetId === 'night_lights') {
+      // Electronic / Synth: Analog synthesizer lead wave with dynamic overtone cascade
+      const real = new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0]);
+      const imag = new Float32Array([0, 0.85, 0.60, 0.45, 0.32, 0.22, 0.15, 0.10, 0.06]);
+      wave = context.createPeriodicWave(real, imag, { disableNormalization: false });
+    } else if (presetId === 'ambient_flowing' || presetId === 'ocean' || presetId === 'ambient') {
+      // Ambient / Flowing: Deep, warm hydroacoustic sinusoidal wave with soft fluid undertones
+      const real = new Float32Array([0, 0, 0, 0, 0]);
+      const imag = new Float32Array([0, 1.0, 0.22, 0.08, 0.02]);
+      wave = context.createPeriodicWave(real, imag, { disableNormalization: false });
+    } else if (presetId === 'organic_nature' || presetId === 'vegetation') {
+      // Organic / Nature-Inspired: Wooden marimba / bamboo acoustic bar resonance
+      const real = new Float32Array([0, 0, 0, 0, 0, 0, 0]);
+      const imag = new Float32Array([0, 1.0, 0.06, 0.38, 0.04, 0.16, 0.05]);
+      wave = context.createPeriodicWave(real, imag, { disableNormalization: false });
+    } else if (presetId === 'cinematic') {
+      // Expansive celestial pad with shimmering overtone series
+      const real = new Float32Array([0, 0, 0, 0, 0, 0, 0, 0]);
+      const imag = new Float32Array([0, 1.0, 0.40, 0.24, 0.16, 0.09, 0.04, 0.02]);
+      wave = context.createPeriodicWave(real, imag, { disableNormalization: false });
+    }
+  } catch {
+    wave = null;
+  }
+
+  contextCache.set(presetId, wave);
+  return wave;
 }
 
 function disconnectVoice(voice) {
@@ -41,10 +261,26 @@ function disconnectVoice(voice) {
       firstError = error;
     }
   }
-  if (voice.gainCreated && !voice.gainDisconnected) {
+  if (voice.filterCreated && !voice.filterDisconnected && voice.filter) {
+    voice.filterDisconnected = true;
+    try {
+      voice.filter.disconnect();
+    } catch (error) {
+      if (!firstError) firstError = error;
+    }
+  }
+  if (voice.gainCreated && !voice.gainDisconnected && voice.gain) {
     voice.gainDisconnected = true;
     try {
       voice.gain.disconnect();
+    } catch (error) {
+      if (!firstError) firstError = error;
+    }
+  }
+  if (voice.pannerCreated && !voice.pannerDisconnected && voice.panner) {
+    voice.pannerDisconnected = true;
+    try {
+      voice.panner.disconnect();
     } catch (error) {
       if (!firstError) firstError = error;
     }
@@ -124,14 +360,23 @@ function scheduleTone(tone, startTime = audioContext.currentTime) {
     stopVoice(oldestVoice, now);
   }
 
+  const scenarioKey = tone.scenario || (tone.dataset ? getDatasetScenario(tone.dataset) : activeScenarioId);
+  const scenarioProfile = scenarioKey ? SCENARIO_PROFILES[scenarioKey] : null;
+  const preset = scenarioProfile || AUDIO_PRESETS[currentPresetId] || AUDIO_PRESETS.ambient;
   const oscillator = audioContext.createOscillator();
   const voice = {
     oscillator,
     gain: null,
+    filter: null,
+    panner: null,
     oscillatorCreated: true,
     gainCreated: false,
+    filterCreated: false,
+    pannerCreated: false,
     oscillatorDisconnected: false,
     gainDisconnected: false,
+    filterDisconnected: false,
+    pannerDisconnected: false,
     started: false,
     stopping: false
   };
@@ -141,24 +386,105 @@ function scheduleTone(tone, startTime = audioContext.currentTime) {
     voice.gain = gain;
     voice.gainCreated = true;
 
-    const voiceHeadroom = MAX_COMBINED_VOICE_GAIN / Math.sqrt(Math.max(1, activeVoices.size + 1));
-    const peakGain = Math.min(0.65, voiceHeadroom * Math.max(0.4, tone.velocity));
-    const noteOnTime = scheduledStart + VOICE_ATTACK_SECONDS;
+    // Optional BiquadFilter (when supported by browser and active preset)
+    let filter = null;
+    if (preset.useFilter && typeof audioContext.createBiquadFilter === 'function') {
+      try {
+        filter = audioContext.createBiquadFilter();
+        filter.type = 'lowpass';
+        const qVal = preset.filterQ || 1.0;
+        let cutoff = 2400;
+        if (preset.filterDynamic) {
+          const maxCutoff = preset.maxCutoffHz || 4800;
+          cutoff = Math.min(maxCutoff, Math.max(900, tone.frequencyHz * 3.2));
+        } else {
+          cutoff = preset.filterCutoffHz || 2600;
+        }
+        filter.frequency.setValueAtTime(cutoff, scheduledStart);
+        filter.Q.setValueAtTime(qVal, scheduledStart);
+        voice.filter = filter;
+        voice.filterCreated = true;
+      } catch {
+        filter = null;
+      }
+    }
+
+    // Optional StereoPanner (when supported by browser and active preset)
+    let panner = null;
+    if (preset.useSpatialPanning && typeof audioContext.createStereoPanner === 'function') {
+      try {
+        panner = audioContext.createStereoPanner();
+        const panValue = Number.isFinite(tone.pan)
+          ? Math.max(-0.85, Math.min(0.85, tone.pan))
+          : 0;
+        panner.pan.setValueAtTime(panValue, scheduledStart);
+        voice.panner = panner;
+        voice.pannerCreated = true;
+      } catch {
+        panner = null;
+      }
+    }
+
+    // Dynamic Headroom & Volume Scaling:
+    // Ensures comfortable, clear volume for 1-2 voices (~0.45 - 0.60)
+    // while dynamically scaling headroom to guarantee multi-voice sum stays safe and musical.
+    const activeCount = Math.max(1, activeVoices.size + 1);
+    const voiceHeadroom = Math.min(0.75, 0.95 / Math.sqrt(activeCount));
+    const perceptualVelocity = Math.max(0.35, Math.pow(tone.velocity, 0.65));
+    const baseGain = voiceHeadroom * perceptualVelocity;
+    const peakGain = Math.min(0.70, baseGain * (preset.gainBoost || 1.0));
+
+    const attackDuration = preset.attackSeconds || VOICE_ATTACK_SECONDS;
+    const releaseDuration = preset.releaseSeconds || VOICE_RELEASE_SECONDS;
+    const releaseLevel = preset.releaseLevel || VOICE_RELEASE_LEVEL;
+
+    const noteOnTime = scheduledStart + attackDuration;
     const noteOffTime = noteOnTime + tone.durationSeconds;
-    const releaseEndTime = noteOffTime + VOICE_RELEASE_SECONDS;
+    const releaseEndTime = noteOffTime + releaseDuration;
     const gainParam = gain.gain;
     voice.endTime = releaseEndTime;
 
-    oscillator.type = tone.timbre || 'sine';
+    // Apply timbre / waveform
+    if (tone.timbre) {
+      oscillator.type = tone.timbre;
+    } else if (preset.id === 'scientific') {
+      oscillator.type = 'sine';
+    } else if (typeof audioContext.createPeriodicWave === 'function') {
+      const waveKey = preset.periodicWaveKey || preset.id;
+      const customWave = getPresetPeriodicWave(audioContext, waveKey);
+      if (customWave) {
+        oscillator.setPeriodicWave(customWave);
+      } else {
+        oscillator.type = preset.waveform || 'triangle';
+      }
+    } else {
+      oscillator.type = preset.waveform || 'triangle';
+    }
+
     oscillator.frequency.setValueAtTime(tone.frequencyHz, scheduledStart);
     gainParam.setValueAtTime(0, scheduledStart);
     gainParam.linearRampToValueAtTime(peakGain, noteOnTime);
-    gainParam.setValueAtTime(peakGain * VOICE_RELEASE_LEVEL, noteOffTime);
+    gainParam.setValueAtTime(peakGain * releaseLevel, noteOffTime);
     gainParam.linearRampToValueAtTime(0, releaseEndTime);
 
     oscillator.onended = () => finishVoice(voice);
-    oscillator.connect(gain);
-    gain.connect(masterGain);
+
+    // Node connections:
+    // oscillator -> [filter] -> gain -> [panner] -> masterGain
+    if (filter) {
+      oscillator.connect(filter);
+      filter.connect(gain);
+    } else {
+      oscillator.connect(gain);
+    }
+
+    if (panner) {
+      gain.connect(panner);
+      panner.connect(masterGain);
+    } else {
+      gain.connect(masterGain);
+    }
+
     activeVoices.add(voice);
     oscillator.start(scheduledStart);
     voice.started = true;
@@ -481,6 +807,8 @@ function getSequenceOffsets(frames, frameIndex, timing) {
 
 function prepareGridPlayback(dataset, frameIndex, timing) {
   const config = resolveDatasetAudioConfig(dataset);
+  const scenario = getDatasetScenario(dataset);
+  setActiveScenario(scenario);
   if (!Number.isInteger(frameIndex) || frameIndex < 0) {
     throw new RangeError('frameIndex must be a non-negative integer.');
   }
@@ -489,7 +817,7 @@ function prepareGridPlayback(dataset, frameIndex, timing) {
     const matrix = getFrameValues(config, frameIndex);
     const mean = meanOfValidCells(matrix);
     return {
-      events: [{ offsetSeconds: 0, tone: mean === null ? null : mapBrightnessToSound(mean) }],
+      events: [{ offsetSeconds: 0, tone: mean === null ? null : { ...mapBrightnessToSound(mean), scenario } }],
       timelineDurationSeconds: 0
     };
   }
@@ -512,7 +840,7 @@ function prepareGridPlayback(dataset, frameIndex, timing) {
     );
     events.push({
       offsetSeconds: offsets[index - frameIndex],
-      tone
+      tone: tone ? { ...tone, scenario } : null
     });
   }
 
@@ -524,11 +852,14 @@ function prepareGridPlayback(dataset, frameIndex, timing) {
 
 function prepareGridScan(dataset, frameIndex) {
   const config = resolveDatasetAudioConfig(dataset);
+  const scenario = getDatasetScenario(dataset);
+  setActiveScenario(scenario);
   const matrix = getFrameValues(config, frameIndex);
   const events = [];
   let cellIndex = 0;
 
   for (let x = 0; x < config.width; x++) {
+    const pan = ((x / Math.max(1, config.width - 1)) * 1.6) - 0.8;
     for (let y = 0; y < config.height; y++) {
       const value = matrix[y][x];
       let tone = null;
@@ -536,6 +867,9 @@ function prepareGridScan(dataset, frameIndex) {
         tone = config.version === '1.0' || !config.useScalarMapping
           ? mapBrightnessToSound(value)
           : mapScalarToSound(value, config.channel, config.profile);
+        if (tone) {
+          tone = { ...tone, pan, scenario };
+        }
       }
       events.push({
         offsetSeconds: cellIndex * SCAN_CELL_INTERVAL_SECONDS,
@@ -599,12 +933,16 @@ function startPlayback(events, timelineDurationSeconds) {
 
   stopAudio();
   const origin = audioContext.currentTime + SCHEDULER_START_LEAD_SECONDS;
+  const preset = AUDIO_PRESETS[currentPresetId] || AUDIO_PRESETS.ambient;
+  const attackDuration = preset.attackSeconds || VOICE_ATTACK_SECONDS;
+  const releaseDuration = preset.releaseSeconds || VOICE_RELEASE_SECONDS;
+
   const lastNoteEnd = events.reduce((end, event) => {
     if (!event.tone) return end;
     return Math.max(
       end,
-      origin + event.offsetSeconds + VOICE_ATTACK_SECONDS +
-        event.tone.durationSeconds + VOICE_RELEASE_SECONDS
+      origin + event.offsetSeconds + attackDuration +
+        event.tone.durationSeconds + releaseDuration
     );
   }, origin + timelineDurationSeconds);
 
@@ -670,9 +1008,29 @@ export async function initAudio() {
       context = new AudioContextConstructor();
       const gain = context.createGain();
       gain.gain.setValueAtTime(masterVolume, context.currentTime);
-      gain.connect(context.destination);
+
+      // Studio Master Limiter / Compressor for clipping prevention and dynamic punch
+      if (typeof context.createDynamicsCompressor === 'function') {
+        try {
+          const compressor = context.createDynamicsCompressor();
+          compressor.threshold.setValueAtTime(-6, context.currentTime);
+          compressor.knee.setValueAtTime(8, context.currentTime);
+          compressor.ratio.setValueAtTime(4, context.currentTime);
+          compressor.attack.setValueAtTime(0.003, context.currentTime);
+          compressor.release.setValueAtTime(0.15, context.currentTime);
+          gain.connect(compressor);
+          compressor.connect(context.destination);
+          masterCompressor = compressor;
+        } catch {
+          gain.connect(context.destination);
+        }
+      } else {
+        gain.connect(context.destination);
+      }
+
       audioContext = context;
       masterGain = gain;
+
       if (typeof context.createAnalyser === 'function') {
         const analyser = context.createAnalyser();
         analyser.fftSize = 256;
@@ -754,7 +1112,6 @@ export async function playComparison(
   );
 }
 
-
 /**
  * Scans one selected frame in left-to-right column order.
  * @param {object} dataset - Complete v1.0 or v1.1 dataset.
@@ -789,10 +1146,48 @@ export function setMasterVolume(value) {
   }
 
   masterVolume = value;
+  if (value > 0) {
+    storedUnmutedVolume = value;
+  }
   if (masterGain && audioContext && audioContext.state !== 'closed') {
     const now = audioContext.currentTime;
     masterGain.gain.cancelScheduledValues(now);
     masterGain.gain.setTargetAtTime(value, now, MASTER_VOLUME_RAMP_SECONDS);
+  }
+}
+
+/**
+ * Gets the current master volume level.
+ * @returns {number}
+ */
+export function getMasterVolume() {
+  return masterVolume;
+}
+
+/**
+ * Returns whether master audio is currently muted.
+ * @returns {boolean}
+ */
+export function isAudioMuted() {
+  return masterVolume === 0;
+}
+
+/**
+ * Mutes master output smoothly while remembering previous volume.
+ */
+export function muteAudio() {
+  if (masterVolume > 0) {
+    storedUnmutedVolume = masterVolume;
+    setMasterVolume(0);
+  }
+}
+
+/**
+ * Unmutes master output smoothly, restoring previous volume.
+ */
+export function unmuteAudio() {
+  if (masterVolume === 0) {
+    setMasterVolume(storedUnmutedVolume > 0 ? storedUnmutedVolume : DEFAULT_MASTER_VOLUME);
   }
 }
 
@@ -824,6 +1219,7 @@ export async function playSoundscape(dataset, frameIndex = 0, { durationSeconds 
 
     colValues.sort((a, b) => b.val - a.val);
     const topValues = colValues.slice(0, 2);
+    const pan = ((x / Math.max(1, config.width - 1)) * 1.6) - 0.8;
 
     for (const item of topValues) {
       const tone = config.version === '1.0' || !config.useScalarMapping
@@ -834,7 +1230,9 @@ export async function playSoundscape(dataset, frameIndex = 0, { durationSeconds 
           offsetSeconds: x * colInterval,
           tone: {
             ...tone,
-            durationSeconds: Math.min(tone.durationSeconds, 0.35)
+            pan,
+            scenario: getDatasetScenario(dataset),
+            durationSeconds: Math.min(Math.max(tone.durationSeconds, 0.28), 0.55)
           }
         });
       }
@@ -857,6 +1255,8 @@ export async function playSoundscape(dataset, frameIndex = 0, { durationSeconds 
 export async function playCell(dataset, frameIndex = 0, x = 0, y = 0) {
   await initAudio();
   const config = resolveDatasetAudioConfig(dataset);
+  const scenario = getDatasetScenario(dataset);
+  setActiveScenario(scenario);
   const matrix = getFrameValues(config, frameIndex);
   if (y < 0 || y >= config.height || x < 0 || x >= config.width) {
     throw new RangeError(`Coordinates (${x}, ${y}) are out of grid bounds.`);
@@ -867,7 +1267,8 @@ export async function playCell(dataset, frameIndex = 0, x = 0, y = 0) {
     ? mapBrightnessToSound(value)
     : mapScalarToSound(value, config.channel, config.profile);
   if (tone) {
-    scheduleTone(tone, audioContext.currentTime);
+    const pan = ((x / Math.max(1, config.width - 1)) * 1.6) - 0.8;
+    scheduleTone({ ...tone, pan, scenario }, audioContext.currentTime);
   }
   return tone;
 }
