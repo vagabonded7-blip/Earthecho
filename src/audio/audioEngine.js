@@ -1,5 +1,9 @@
-import { mapBrightnessToSound, mapScalarToSound } from './mapping.js';
-
+import {
+  mapBrightnessToSound,
+  mapScalarToSound,
+  selectScaleNote,
+  midiToFrequency
+} from './mapping.js';
 import { prepareComparisonPlayback } from './comparison.js';
 
 const MAX_VOICES = 8;
@@ -124,6 +128,24 @@ export const SCENARIO_PROFILES = Object.freeze({
     maxCutoffHz: 2600,
     useSpatialPanning: true,
     periodicWaveKey: 'organic_nature'
+  },
+  temperature: {
+    id: 'temperature',
+    name: 'Temperature (Atmospheric Harmonies)',
+    genre: 'Atmospheric / Warm Synth',
+    description: 'Atmospheric evolving harmonies, warm analog synthesizer textures, and thermal spatial diffusion.',
+    waveform: 'triangle',
+    attackSeconds: 0.065,
+    releaseSeconds: 0.40,
+    releaseLevel: 0.75,
+    gainBoost: 1.30,
+    useFilter: true,
+    filterDynamic: true,
+    filterCutoffHz: 2000,
+    filterQ: 1.1,
+    maxCutoffHz: 3400,
+    useSpatialPanning: true,
+    periodicWaveKey: 'atmospheric_temperature'
   }
 });
 
@@ -136,11 +158,16 @@ export function getDatasetScenario(dataset) {
   const id = dataset.id?.toLowerCase() || '';
   const title = dataset.title?.toLowerCase() || '';
 
-  if (group.includes('ocean') || id.includes('ocean') || id.includes('sea') || title.includes('sea') || title.includes('ocean')) {
+  // Categorize based on environmental domains.
+  // Note: sea_surface_temp is the NASA ocean observation dataset.
+  if (group.includes('ocean') || id.includes('sea') || id.includes('ocean') || title.includes('sea') || title.includes('ocean')) {
     return 'ocean';
   }
   if (group.includes('veg') || id.includes('veg') || title.includes('veg') || title.includes('ndvi') || title.includes('forest')) {
     return 'vegetation';
+  }
+  if (group.includes('temp') || id.includes('temp') || title.includes('temperature') || title.includes('thermal')) {
+    return 'temperature';
   }
   return 'night_lights';
 }
@@ -148,7 +175,9 @@ export function getDatasetScenario(dataset) {
 export function setActiveScenario(scenarioId) {
   if (typeof scenarioId !== 'string') return SCENARIO_PROFILES[activeScenarioId];
   const s = scenarioId.toLowerCase();
-  if (s.includes('ocean') || s.includes('ambient') || s.includes('flow')) {
+  if (s.includes('temp') || s.includes('thermal')) {
+    activeScenarioId = 'temperature';
+  } else if (s.includes('ocean') || s.includes('ambient') || s.includes('flow')) {
     activeScenarioId = 'ocean';
   } else if (s.includes('veg') || s.includes('organic') || s.includes('nature')) {
     activeScenarioId = 'vegetation';
@@ -164,6 +193,29 @@ export function getActiveScenario() {
 
 export function getScenarioProfiles() {
   return SCENARIO_PROFILES;
+}
+
+/**
+ * Selects the sound preset suitable for a given dataset ID or scenario name.
+ * Exposes a clear, modular integration API for the frontend.
+ * @param {string} datasetId - e.g. 'night_lights_2012_2023', 'sea_surface_temp', 'vegetation_ndvi_2020_2023', 'temperature'
+ * @returns {object} The activated preset configuration.
+ */
+export function selectDatasetPreset(datasetId) {
+  if (!datasetId || typeof datasetId !== 'string') {
+    throw new TypeError('datasetId must be a non-empty string.');
+  }
+  const idLower = datasetId.toLowerCase();
+  let scenario = 'night_lights';
+  if (idLower.includes('ocean') || idLower.includes('sea')) {
+    scenario = 'ocean';
+  } else if (idLower.includes('veg') || idLower.includes('ndvi') || idLower.includes('forest')) {
+    scenario = 'vegetation';
+  } else if (idLower.includes('temp') || idLower.includes('thermal')) {
+    scenario = 'temperature';
+  }
+  const profile = setActiveScenario(scenario);
+  return { ...profile, scenario };
 }
 
 let audioContext = null;
@@ -235,6 +287,11 @@ function getPresetPeriodicWave(context, presetId) {
       // Organic / Nature-Inspired: Wooden marimba / bamboo acoustic bar resonance
       const real = new Float32Array([0, 0, 0, 0, 0, 0, 0]);
       const imag = new Float32Array([0, 1.0, 0.06, 0.38, 0.04, 0.16, 0.05]);
+      wave = context.createPeriodicWave(real, imag, { disableNormalization: false });
+    } else if (presetId === 'atmospheric_temperature' || presetId === 'temperature') {
+      // Atmospheric Harmonies: Evolving harmonic warmth with subtle shimmering overtone series
+      const real = new Float32Array([0, 0, 0, 0, 0, 0, 0, 0]);
+      const imag = new Float32Array([0, 1.0, 0.35, 0.18, 0.10, 0.05, 0.02, 0.01]);
       wave = context.createPeriodicWave(real, imag, { disableNormalization: false });
     } else if (presetId === 'cinematic') {
       // Expansive celestial pad with shimmering overtone series
@@ -1096,13 +1153,39 @@ export async function playGrid(dataset, frameIndex = 0, timing) {
  * @returns {Promise<void>}
  */
 export async function playComparison(
-  dataset2012,
-  dataset2023,
+  firstPeriod,
+  secondPeriod,
   options = {}
 ) {
+  let baseline = firstPeriod;
+  let target = secondPeriod;
+
+  // Support period comparison within the same multi-frame dataset
+  if (options.dataset && typeof firstPeriod === 'number' && typeof secondPeriod === 'number') {
+    const ds = options.dataset;
+    const chId = ds.channels?.[0]?.id;
+    baseline = {
+      ...ds,
+      width: ds.width,
+      height: ds.height,
+      normalization: ds.normalization || { source_min: 0, source_max: 255 },
+      values: ds.frames?.[firstPeriod]?.values?.[chId] || ds.values
+    };
+    target = {
+      ...ds,
+      width: ds.width,
+      height: ds.height,
+      normalization: ds.normalization || { source_min: 0, source_max: 255 },
+      values: ds.frames?.[secondPeriod]?.values?.[chId] || ds.values
+    };
+  }
+
+  const scenario = getDatasetScenario(baseline || target || options.dataset);
+  selectDatasetPreset(scenario);
+
   const prepared = prepareComparisonPlayback(
-    dataset2012,
-    dataset2023,
+    baseline,
+    target,
     options
   );
 
@@ -1110,6 +1193,302 @@ export async function playComparison(
     prepared.events,
     prepared.timelineDurationSeconds
   );
+}
+
+/**
+ * Plays location-based music for a selected geographic coordinate or cell.
+ * Retrieves real NASA dataset values at that coordinate and synthesizes a local melodic phrase.
+ *
+ * @param {object} selection - { dataset, lat, lon, gridX, gridY, name, region }
+ * @param {number|string} [period=0] - Frame index or epoch label
+ * @returns {Promise<object>}
+ */
+export async function playLocation(selection, period = 0) {
+  if (!selection || typeof selection !== 'object') {
+    throw new TypeError('selection must be an object specifying location and dataset.');
+  }
+
+  const dataset = selection.dataset;
+  if (!dataset) {
+    throw new TypeError('selection.dataset is required to play location sonification.');
+  }
+
+  await initAudio();
+
+  const config = resolveDatasetAudioConfig(dataset);
+  const scenario = getDatasetScenario(dataset);
+  selectDatasetPreset(scenario);
+
+  let frameIndex = 0;
+  if (typeof period === 'number' && Number.isInteger(period)) {
+    frameIndex = Math.max(0, Math.min(config.frames.length - 1, period));
+  } else if (typeof period === 'string') {
+    const idx = config.frames.findIndex(f =>
+      (f.label && f.label.includes(period)) ||
+      (f.timestamp && f.timestamp.includes(period))
+    );
+    if (idx !== -1) frameIndex = idx;
+  }
+
+  const matrix = getFrameValues(config, frameIndex);
+  const w = config.width;
+  const h = config.height;
+
+  let x = selection.gridX;
+  let y = selection.gridY;
+  if (!Number.isInteger(x) || !Number.isInteger(y)) {
+    if (Number.isFinite(selection.lat) && Number.isFinite(selection.lon)) {
+      x = Math.min(w - 1, Math.max(0, Math.floor(((selection.lon + 180) / 360) * w) % w));
+      y = Math.min(h - 1, Math.max(0, Math.floor(((90 - selection.lat) / 180) * h)));
+    } else {
+      x = Math.floor(w / 2);
+      y = Math.floor(h / 2);
+    }
+  }
+
+  x = Math.max(0, Math.min(w - 1, x));
+  y = Math.max(0, Math.min(h - 1, y));
+
+  const centerVal = matrix[y]?.[x] ?? null;
+  const pan = ((x / Math.max(1, w - 1)) * 1.6) - 0.8;
+
+  if (centerVal === null) {
+    return {
+      status: 'unavailable',
+      value: null,
+      gridX: x,
+      gridY: y,
+      scenario,
+      events: []
+    };
+  }
+
+  // Sample local spatial neighborhood (center, east, west, north) for data-driven musical phrase
+  const offsets = [
+    { dx: 0, dy: 0, delay: 0.0 },
+    { dx: 1, dy: 0, delay: 0.16 },
+    { dx: -1, dy: 0, delay: 0.32 },
+    { dx: 0, dy: -1, delay: 0.48 }
+  ];
+
+  const events = [];
+  for (const item of offsets) {
+    const nx = Math.max(0, Math.min(w - 1, x + item.dx));
+    const ny = Math.max(0, Math.min(h - 1, y + item.dy));
+    const rawVal = matrix[ny]?.[nx];
+    const val = rawVal !== null && rawVal !== undefined ? rawVal : centerVal;
+
+    let tone = config.version === '1.0' || !config.useScalarMapping
+      ? mapBrightnessToSound(val)
+      : mapScalarToSound(val, config.channel, config.profile);
+
+    if (tone) {
+      tone = {
+        ...tone,
+        pan: Math.max(-0.85, Math.min(0.85, pan + item.dx * 0.15)),
+        scenario,
+        durationSeconds: Math.min(Math.max(tone.durationSeconds, 0.22), 0.5)
+      };
+      events.push({
+        offsetSeconds: item.delay,
+        tone
+      });
+    }
+  }
+
+  const durationSeconds = 0.85;
+  await startPlayback(events, durationSeconds);
+
+  return {
+    status: 'success',
+    value: centerVal,
+    gridX: x,
+    gridY: y,
+    period: frameIndex,
+    scenario,
+    events
+  };
+}
+
+/**
+ * Generates a deterministic, reproducible short musical motif and fingerprint metadata
+ * derived from the selected dataset, geographical location, observation period, and real data.
+ *
+ * @param {object} dataset
+ * @param {object} location - { lat, lon, name, region }
+ * @param {number} [frameIndex=0]
+ * @returns {object} Deterministic audio fingerprint object with musical motif
+ */
+export function generateAudioFingerprint(dataset, location, frameIndex = 0) {
+  if (!dataset) {
+    throw new TypeError('dataset is required to generate audio fingerprint.');
+  }
+  const config = resolveDatasetAudioConfig(dataset);
+  const scenario = getDatasetScenario(dataset);
+  const matrix = getFrameValues(config, frameIndex);
+  const w = config.width;
+  const h = config.height;
+
+  const lat = location?.lat ?? 0;
+  const lon = location?.lon ?? 0;
+  const gridX = Math.min(w - 1, Math.max(0, Math.floor(((lon + 180) / 360) * w) % w));
+  const gridY = Math.min(h - 1, Math.max(0, Math.floor(((90 - lat) / 180) * h)));
+  const val = matrix[gridY]?.[gridX];
+  const safeVal = val !== null && Number.isFinite(val) ? val : 0.5;
+
+  const year = dataset.frames?.[frameIndex]?.label ||
+    dataset.frames?.[frameIndex]?.timestamp?.match(/\d{4}/)?.[0] ||
+    dataset.observation_date?.match(/\d{4}/)?.[0] || '2023';
+
+  // Distinctive dataset prefix code
+  const dsCode = scenario === 'ocean' ? 'OC' :
+    scenario === 'vegetation' ? 'VG' :
+    scenario === 'temperature' ? 'TP' : 'NL';
+
+  const latStr = `${Math.abs(Math.round(lat))}${lat >= 0 ? 'N' : 'S'}`;
+  const lonStr = `${Math.abs(Math.round(lon))}${lon >= 0 ? 'E' : 'W'}`;
+  const valSeed = Math.round(safeVal * 1000);
+  const id = `${dsCode}-${String(year).slice(-2)}-${latStr}-${lonStr}-${valSeed}`;
+
+  // Deterministic 4-note musical motif derived from actual coordinates and data value
+  const tonicMidi = scenario === 'ocean' ? 53 : // F3 deep ocean
+    scenario === 'vegetation' ? 55 : // G3 organic natural
+    scenario === 'temperature' ? 57 : // A3 warm atmospheric
+    60; // C4 bright electronic
+
+  const rootMidi = selectScaleNote(Math.max(0, Math.min(1, safeVal)), {
+    tonicMidi,
+    minMidi: 45,
+    maxMidi: 80,
+    mode: 'majorPentatonic'
+  });
+
+  const latNorm = (lat + 90) / 180;
+  const thirdMidi = selectScaleNote(latNorm, {
+    tonicMidi,
+    minMidi: 48,
+    maxMidi: 84,
+    mode: 'majorPentatonic'
+  });
+
+  const lonNorm = (lon + 180) / 360;
+  const fifthMidi = selectScaleNote(lonNorm, {
+    tonicMidi,
+    minMidi: 52,
+    maxMidi: 88,
+    mode: 'majorPentatonic'
+  });
+
+  const apexPos = Math.min(1, Math.max(0, (safeVal * 0.6) + (latNorm * 0.4)));
+  const apexMidi = selectScaleNote(apexPos, {
+    tonicMidi,
+    minMidi: 57,
+    maxMidi: 91,
+    mode: 'majorPentatonic'
+  });
+
+  const pan = (lonNorm * 1.6) - 0.8;
+
+  const motif = [
+    {
+      midi: rootMidi,
+      frequencyHz: midiToFrequency(rootMidi),
+      offsetSeconds: 0.0,
+      durationSeconds: 0.45,
+      velocity: 0.75,
+      pan: pan * 0.5,
+      scenario
+    },
+    {
+      midi: thirdMidi,
+      frequencyHz: midiToFrequency(thirdMidi),
+      offsetSeconds: 0.18,
+      durationSeconds: 0.40,
+      velocity: 0.70,
+      pan: Math.max(-0.8, pan - 0.25),
+      scenario
+    },
+    {
+      midi: fifthMidi,
+      frequencyHz: midiToFrequency(fifthMidi),
+      offsetSeconds: 0.36,
+      durationSeconds: 0.42,
+      velocity: 0.68,
+      pan: Math.min(0.8, pan + 0.25),
+      scenario
+    },
+    {
+      midi: apexMidi,
+      frequencyHz: midiToFrequency(apexMidi),
+      offsetSeconds: 0.54,
+      durationSeconds: 0.65,
+      velocity: 0.65,
+      pan,
+      scenario
+    }
+  ];
+
+  return {
+    id,
+    datasetId: dataset.id,
+    year,
+    lat,
+    lon,
+    value: val,
+    scenario,
+    motif
+  };
+}
+
+/**
+ * Plays a short, reproducible musical motif for an audio fingerprint.
+ * @param {object} fingerprint - Audio fingerprint object with motif array
+ * @returns {Promise<void>}
+ */
+export async function playFingerprint(fingerprint) {
+  if (!fingerprint || typeof fingerprint !== 'object') {
+    throw new TypeError('fingerprint must be a valid fingerprint object.');
+  }
+
+  const motif = Array.isArray(fingerprint.motif)
+    ? fingerprint.motif
+    : Array.isArray(fingerprint.events)
+      ? fingerprint.events
+      : null;
+
+  if (!motif || motif.length === 0) {
+    throw new RangeError('fingerprint must contain a non-empty motif array.');
+  }
+
+  await initAudio();
+
+  const scenario = fingerprint.scenario || activeScenarioId;
+  selectDatasetPreset(scenario);
+
+  const events = motif.map(note => ({
+    offsetSeconds: note.offsetSeconds || 0,
+    tone: {
+      frequencyHz: note.frequencyHz || midiToFrequency(note.midi || 60),
+      durationSeconds: note.durationSeconds || 0.4,
+      velocity: note.velocity || 0.7,
+      pan: note.pan || 0,
+      scenario: note.scenario || scenario
+    }
+  }));
+
+  const lastEvent = events[events.length - 1];
+  const totalDuration = (lastEvent.offsetSeconds || 0) + (lastEvent.tone.durationSeconds || 0.5) + 0.2;
+
+  return startPlayback(events, totalDuration);
+}
+
+/**
+ * Stops any active audio playback session and clears all voices.
+ * Alias for stopAudio().
+ * @returns {Promise<void>}
+ */
+export async function stopPlayback() {
+  return stopAudio();
 }
 
 /**

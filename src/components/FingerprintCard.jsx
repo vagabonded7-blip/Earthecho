@@ -1,5 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { initAudio, playTone } from '../audio/audioEngine.js';
+import {
+  initAudio,
+  playTone,
+  generateAudioFingerprint,
+  playFingerprint
+} from '../audio/audioEngine.js';
 import { midiToFrequency, selectScaleNote } from '../audio/scales.js';
 
 // Deterministic 32-bit hash function
@@ -143,48 +148,54 @@ export default function FingerprintCard({
     if (isPlaying) return;
     setIsPlaying(true);
     try {
-      await initAudio();
-      // Generate a 3-note harmonic triad from the fingerprint
-      const seedVal = dataValue !== null && dataValue !== undefined ? dataValue : 0.5;
-      const pos = Math.max(0, Math.min(1, seedVal));
+      if (dataset) {
+        const fp = generateAudioFingerprint(dataset, selectedLocation || { lat, lon }, frameIndex);
+        await playFingerprint(fp);
+        setTimeout(() => setIsPlaying(false), 1400);
+      } else {
+        await initAudio();
+        // Fallback 3-note harmonic triad if dataset object is not loaded
+        const seedVal = dataValue !== null && dataValue !== undefined ? dataValue : 0.5;
+        const pos = Math.max(0, Math.min(1, seedVal));
 
-      const midiRoot = selectScaleNote(pos, { tonicMidi: 55, minMidi: 48, maxMidi: 79, mode: 'majorPentatonic' });
-      const midiThird = selectScaleNote(Math.min(1, pos + 0.25), { tonicMidi: 55, minMidi: 48, maxMidi: 79, mode: 'majorPentatonic' });
-      const midiFifth = selectScaleNote(Math.min(1, pos + 0.5), { tonicMidi: 55, minMidi: 48, maxMidi: 79, mode: 'majorPentatonic' });
+        const midiRoot = selectScaleNote(pos, { tonicMidi: 55, minMidi: 48, maxMidi: 79, mode: 'majorPentatonic' });
+        const midiThird = selectScaleNote(Math.min(1, pos + 0.25), { tonicMidi: 55, minMidi: 48, maxMidi: 79, mode: 'majorPentatonic' });
+        const midiFifth = selectScaleNote(Math.min(1, pos + 0.5), { tonicMidi: 55, minMidi: 48, maxMidi: 79, mode: 'majorPentatonic' });
 
-      await playTone({
-        midi: midiRoot,
-        frequencyHz: midiToFrequency(midiRoot),
-        velocity: 0.7,
-        durationSeconds: 0.35,
-        timbre: 'triangle'
-      });
-
-      setTimeout(() => {
-        playTone({
-          midi: midiThird,
-          frequencyHz: midiToFrequency(midiThird),
-          velocity: 0.65,
-          durationSeconds: 0.4,
-          timbre: 'sine'
+        await playTone({
+          midi: midiRoot,
+          frequencyHz: midiToFrequency(midiRoot),
+          velocity: 0.7,
+          durationSeconds: 0.35,
+          timbre: 'triangle'
         });
-      }, 180);
 
-      setTimeout(() => {
-        playTone({
-          midi: midiFifth,
-          frequencyHz: midiToFrequency(midiFifth),
-          velocity: 0.6,
-          durationSeconds: 0.6,
-          timbre: 'sine'
-        });
-      }, 360);
+        setTimeout(() => {
+          playTone({
+            midi: midiThird,
+            frequencyHz: midiToFrequency(midiThird),
+            velocity: 0.65,
+            durationSeconds: 0.4,
+            timbre: 'sine'
+          });
+        }, 180);
 
-      setTimeout(() => setIsPlaying(false), 900);
+        setTimeout(() => {
+          playTone({
+            midi: midiFifth,
+            frequencyHz: midiToFrequency(midiFifth),
+            velocity: 0.6,
+            durationSeconds: 0.6,
+            timbre: 'sine'
+          });
+        }, 360);
+
+        setTimeout(() => setIsPlaying(false), 900);
+      }
     } catch {
       setIsPlaying(false);
     }
-  }, [isPlaying, dataValue]);
+  }, [isPlaying, dataset, selectedLocation, frameIndex, lat, lon, dataValue]);
 
   // Export as PNG image download
   const handleDownloadPNG = () => {

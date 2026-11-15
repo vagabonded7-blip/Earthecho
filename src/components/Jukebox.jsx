@@ -15,7 +15,10 @@ import {
   playCell,
   stopAudio,
   setMasterVolume,
-  getAudioAnalyser
+  getAudioAnalyser,
+  setActiveScenario,
+  getDatasetScenario,
+  SCENARIO_PROFILES
 } from '../audio/audioEngine.js';
 
 // Clean vector iconography
@@ -110,7 +113,8 @@ export default function Jukebox({
   dataStatus,
   error,
   retryLabel,
-  onRetry
+  onRetry,
+  onReplayIntro
 }) {
   const [frameIndex, setFrameIndex] = useState(0);
   const [isGlobalView, setIsGlobalView] = useState(false);
@@ -153,23 +157,26 @@ export default function Jukebox({
     return '2023';
   }, [frames, frameIndex, dataset]);
 
-  // Primary NASA datasets
+  // Primary NASA datasets with tailored scenario sound styles
   const primaryDatasets = [
     {
       id: 'night_lights_2012_2023',
       name: 'Night Lights',
+      soundStyle: 'Electronic / Synth Music',
       icon: <NightLightsIcon />,
       theme: 'lights'
     },
     {
       id: 'sea_surface_temp',
       name: 'Ocean',
+      soundStyle: 'Ambient / Flowing Music',
       icon: <OceanIcon />,
       theme: 'ocean'
     },
     {
       id: 'vegetation_ndvi_2020_2023',
       name: 'Vegetation',
+      soundStyle: 'Organic / Nature-Inspired Music',
       icon: <VegetationIcon />,
       theme: 'veg'
     }
@@ -182,6 +189,36 @@ export default function Jukebox({
     if (selectedId.includes('veg') || selectedId.includes('ndvi')) return 'vegetation_ndvi_2020_2023';
     return selectedId;
   }, [selectedId]);
+
+  const currentScenario = useMemo(() => {
+    return getDatasetScenario(dataset);
+  }, [dataset]);
+
+  useEffect(() => {
+    setActiveScenario(currentScenario);
+  }, [currentScenario]);
+
+  const scenarioMeta = useMemo(() => {
+    if (currentScenario === 'ocean') {
+      return {
+        genre: 'Ambient / Flowing Music',
+        icon: '🌊',
+        desc: 'Deep hydroacoustic warmth, swell envelopes, and atmospheric ocean currents.'
+      };
+    }
+    if (currentScenario === 'vegetation') {
+      return {
+        genre: 'Organic / Nature-Inspired Music',
+        icon: '🌿',
+        desc: 'Acoustic marimba, bamboo kalimba transients, and natural resonance.'
+      };
+    }
+    return {
+      genre: 'Electronic / Synth Music',
+      icon: '⚡',
+      desc: 'Punchy analog synth waveforms, dynamic filter sweeps, and energetic spatial panning.'
+    };
+  }, [currentScenario]);
 
   // Parse Shareable URL Query Parameters on Load
   useEffect(() => {
@@ -295,6 +332,12 @@ export default function Jukebox({
     setIsPlaying(false);
     setPlayMode(null);
     setFrameIndex(0);
+    const scenarioKey = id.includes('ocean') || id.includes('sea')
+      ? 'ocean'
+      : id.includes('veg') || id.includes('ndvi')
+        ? 'vegetation'
+        : 'night_lights';
+    setActiveScenario(scenarioKey);
     onSelect(id);
   };
 
@@ -510,13 +553,21 @@ export default function Jukebox({
       <main className="observatory-card">
         {/* ── Top Header Navigation ── */}
         <header className="observatory-header">
-          <div className="brand-lockup">
+          <div
+            className="brand-lockup"
+            onClick={onReplayIntro}
+            style={onReplayIntro ? { cursor: 'pointer' } : undefined}
+            title={onReplayIntro ? 'Replay Cinematic Earth Orbit Intro' : undefined}
+          >
             <div className="brand-symbol">
               <LogoSymbol />
             </div>
             <div className="brand-titles">
               <h1 className="main-logo-title">EARTH ECHO</h1>
-              <p className="main-logo-subtitle">HEAR THE PLANET CHANGE</p>
+              <p className="main-logo-subtitle">
+                <span className={`brand-live-dot ${isPlaying ? 'is-live' : ''}`} aria-hidden="true" />
+                HEAR THE PLANET CHANGE
+              </p>
             </div>
           </div>
 
@@ -564,6 +615,16 @@ export default function Jukebox({
 
           {/* Action Header Pills */}
           <div className="header-action-group">
+            {onReplayIntro && (
+              <button
+                type="button"
+                className="header-action-pill orbit-pill"
+                onClick={onReplayIntro}
+                title="Replay Cinematic 13s Earth Orbit Animation"
+              >
+                <span>⟲ ORBIT INTRO</span>
+              </button>
+            )}
             {frames.length >= 2 && (
               <button
                 type="button"
@@ -637,6 +698,9 @@ export default function Jukebox({
                     {locationData?.formattedVal || 'Loading...'}
                   </span>
                 </div>
+                <div className="data-availability-bar" aria-hidden="true">
+                  <span className={`data-availability-fill ${locationData?.isAvailable ? 'available' : 'unavailable'}`} />
+                </div>
                 <button
                   type="button"
                   className={`listen-location-btn ${!locationData?.isAvailable ? 'disabled' : ''}`}
@@ -677,7 +741,10 @@ export default function Jukebox({
                       onClick={() => handleDatasetSelect(ds.id)}
                     >
                       <span className="row-icon">{ds.icon}</span>
-                      <span className="row-label">{ds.name}</span>
+                      <div className="row-text-group">
+                        <span className="row-label">{ds.name}</span>
+                        <span className="row-sound-tag">{ds.soundStyle}</span>
+                      </div>
                     </button>
                   );
                 })}
@@ -687,9 +754,24 @@ export default function Jukebox({
             {/* Card 4: TIME PERIOD SCRUBBER */}
             <div className="control-panel time-period-card">
               <span className="panel-kicker">TIME PERIOD</span>
-              <div className="time-display-val">{currentYear}</div>
+              
+              <div className="time-display-row">
+                <span className="time-display-val">{currentYear}</span>
+                <span className="time-display-meta">
+                  {frames.length > 1 ? `EPOCH ${frameIndex + 1} / ${frames.length}` : 'SINGLE EPOCH'}
+                </span>
+              </div>
 
               <div className="slider-wrapper">
+                <div className="slider-ticks" aria-hidden="true">
+                  {frames.map((f, i) => (
+                    <span
+                      key={i}
+                      className={`slider-tick ${i <= frameIndex ? 'passed' : ''}`}
+                      style={{ left: `${frames.length > 1 ? (i / (frames.length - 1)) * 100 : 50}%` }}
+                    />
+                  ))}
+                </div>
                 <input
                   type="range"
                   min="0"
@@ -702,6 +784,13 @@ export default function Jukebox({
                   aria-label="Observation period slider"
                   disabled={frames.length <= 1}
                 />
+                <span
+                  className="slider-thumb-label"
+                  style={{ left: `${sliderPercentage}%` }}
+                  aria-hidden="true"
+                >
+                  {currentYear}
+                </span>
               </div>
 
               <p className="panel-caption">Choose an available observation year</p>
@@ -716,6 +805,9 @@ export default function Jukebox({
               <h2 className="sonification-title">PLANETARY SONIFICATION</h2>
               <span className="sonification-status-pill">
                 {isPlaying ? `● LIVE SYNTHESIS (${playMode?.toUpperCase() || 'AUDIO'})` : '○ READY'}
+              </span>
+              <span className="sonification-genre-badge" title={scenarioMeta.desc}>
+                {scenarioMeta.icon} {scenarioMeta.genre}
               </span>
             </div>
 
@@ -742,37 +834,47 @@ export default function Jukebox({
 
           {/* Center Player Transport & Volume Deck */}
           <div className="player-transport-deck">
-            <button
-              type="button"
-              className="transport-icon-btn"
-              onClick={handlePrevious}
-              title="Previous epoch / Restart"
-              aria-label="Previous epoch"
-            >
-              <PrevIcon />
-            </button>
+            <div className="transport-now-playing" aria-live="polite">
+              <span className="transport-np-kicker">NOW PLAYING</span>
+              <span className="transport-np-title">
+                {isPlaying
+                  ? `${playMode === 'soundscape' ? 'Global Soundscape' : playMode === 'cell' ? 'Location Cell' : playMode === 'scan' ? 'Grid Scan' : 'Comparison'} · ${scenarioMeta.genre} (${currentYear})`
+                  : `${scenarioMeta.genre} · Ready to sonify`}
+              </span>
+            </div>
 
-            <button
-              type="button"
-              className={`main-play-btn ${isPlaying ? 'playing' : ''}`}
-              onClick={handleTogglePlay}
-              title={isPlaying ? 'Pause / Stop Soundscape' : 'Play Global Soundscape'}
-              aria-label={isPlaying ? 'Pause' : 'Play'}
-            >
-              {isPlaying ? <PauseIcon /> : <PlayIcon />}
-            </button>
+            <div className="transport-controls">
+              <button
+                type="button"
+                className="transport-icon-btn transport-icon-btn--aux"
+                onClick={handlePrevious}
+                title="Previous epoch / Restart"
+                aria-label="Previous epoch"
+              >
+                <PrevIcon />
+              </button>
 
-            <button
-              type="button"
-              className="transport-icon-btn"
-              onClick={handleStop}
-              title="Stop audio playback"
-              aria-label="Stop playback"
-            >
-              <StopIcon />
-            </button>
+              <button
+                type="button"
+                className={`main-play-btn ${isPlaying ? 'playing' : ''}`}
+                onClick={handleTogglePlay}
+                title={isPlaying ? 'Pause / Stop Soundscape' : 'Play Global Soundscape'}
+                aria-label={isPlaying ? 'Pause' : 'Play'}
+              >
+                {isPlaying ? <PauseIcon /> : <PlayIcon />}
+              </button>
 
-            {/* Quick Volume & Mute in Transport Bar */}
+              <button
+                type="button"
+                className="transport-icon-btn transport-icon-btn--aux"
+                onClick={handleStop}
+                title="Stop audio playback"
+                aria-label="Stop playback"
+              >
+                <StopIcon />
+              </button>
+            </div>
+
             <div className="transport-volume-group">
               <button
                 type="button"
@@ -835,12 +937,34 @@ export default function Jukebox({
                 </div>
 
                 <div className="studio-col">
-                  <span className="drawer-label">SCIENTIFIC SONIFICATION PROFILE</span>
-                  <p className="mapping-blurb">
-                    <strong>Scale:</strong> Pentatonic Major (Tonic: 220 Hz / A3).<br />
-                    <strong>Spatial Panning:</strong> Longitude maps to stereo stereo angle [-1, +1].<br />
-                    <strong>Scientific Integrity:</strong> Masked cells remain silent to prevent absence of data being mistaken for zero.
-                  </p>
+                  <span className="drawer-label">SCENARIO SOUND STYLE</span>
+                  <div className="mode-btn-group">
+                    {[
+                      { id: 'night_lights', label: '⚡ Electronic / Synth', sub: 'Night Lights' },
+                      { id: 'ocean', label: '🌊 Ambient / Flowing', sub: 'Ocean' },
+                      { id: 'vegetation', label: '🌿 Organic / Nature', sub: 'Vegetation' }
+                    ].map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className={`sub-mode-btn ${currentScenario === item.id ? 'active' : ''}`}
+                        onClick={() => {
+                          setActiveScenario(item.id);
+                          const targetDs = item.id === 'ocean'
+                            ? 'sea_surface_temp'
+                            : item.id === 'vegetation'
+                              ? 'vegetation_ndvi_2020_2023'
+                              : 'night_lights_2012_2023';
+                          if (activeDatasetId !== targetDs) {
+                            handleDatasetSelect(targetDs);
+                          }
+                        }}
+                        title={`Select ${item.label} for ${item.sub}`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>

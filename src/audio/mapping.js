@@ -3,6 +3,8 @@ import {
   selectScaleNote
 } from './scales.js';
 
+export { midiToFrequency, selectScaleNote };
+
 const DEFAULT_BRIGHTNESS_OPTIONS = Object.freeze({
   tonicMidi: 60,
   minMidi: 48,

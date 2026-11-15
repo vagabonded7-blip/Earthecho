@@ -1,22 +1,51 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import * as THREE from 'three';
+import { findNearestLocation } from '../data/worldLocations.js';
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-function getMatrix(dataset, frameIndex) {
-  if (!dataset) return null;
-  const frame = dataset.frames?.[frameIndex];
-  if (frame?.values) {
-    const ch = dataset.channels?.[0]?.id || Object.keys(frame.values)[0];
-    return frame.values[ch] || null;
-  }
-  return dataset.values || null;
+// Convert Latitude & Longitude to 3D Cartesian coordinates on sphere
+function latLonToVector3(lat, lon, radius = 1.0) {
+  const phi = (90 - lat) * (Math.PI / 180);
+  const theta = (lon + 180) * (Math.PI / 180);
+  const x = -(radius * Math.sin(phi) * Math.cos(theta));
+  const z = radius * Math.sin(phi) * Math.sin(theta);
+  const y = radius * Math.cos(phi);
+  return new THREE.Vector3(x, y, z);
 }
 
-function kindOf(id = '') {
-  if (/ocean|sea/.test(id)) return 'ocean';
-  if (/veg|forest|ndvi/.test(id)) return 'veg';
-  return 'lights';
+// Convert 3D Cartesian point on sphere back to Latitude & Longitude
+function vector3ToLatLon(v) {
+  const norm = v.clone().normalize();
+  const lat = 90 - Math.acos(clamp(norm.y, -1, 1)) * (180 / Math.PI);
+  let lon = (Math.atan2(norm.z, -norm.x) * (180 / Math.PI)) - 180;
+  while (lon < -180) lon += 360;
+  while (lon > 180) lon -= 360;
+  return { lat, lon };
 }
+
+// Custom Atmospheric Rayleigh Scattering Shader (ethereal NASA orbit glow)
+const AtmosphereShader = {
+  vertexShader: `
+    varying vec3 vNormal;
+    varying vec3 vPosition;
+    void main() {
+      vNormal = normalize(normalMatrix * normal);
+      vPosition = (modelViewMatrix * vec4(position, 1.0)).xyz;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    varying vec3 vNormal;
+    varying vec3 vPosition;
+    void main() {
+      vec3 viewDir = normalize(-vPosition);
+      float intensity = pow(0.68 - dot(vNormal, viewDir), 2.8);
+      vec3 atmosphereColor = vec3(0.24, 0.68, 0.98); // Rayleigh blue rim
+      gl_FragColor = vec4(atmosphereColor, intensity * 0.95);
+    }
+  `
+};
 
 export default function EarthGlobe({
   dataset,
@@ -27,484 +56,522 @@ export default function EarthGlobe({
   onToggleView,
   focusCoords
 }) {
-  const canvasRef = useRef(null);
-  const animRef = useRef(null);
-  const pulseRef = useRef(0);
+  const threeMountRef = useRef(null);
+  const canvas2dRef = useRef(null);
 
-  // 3D Navigation State: Rotation, Tilt, and Zoom
-  const [rotation, setRotation] = useState(0.8); // Y-axis rotation (radians)
-  const [tilt, setTilt] = useState(0.12);        // X-axis tilt (radians)
-  const [zoom, setZoom] = useState(1.0);         // Zoom scale [0.75 - 2.8]
+  // References for Three.js scene
+  const sceneRef = useRef(null);
+  const cameraRef = useRef(null);
+  const rendererRef = useRef(null);
+  const earthGroupRef = useRef(null);
+  const earthMeshRef = useRef(null);
+  const selectedPinGroupRef = useRef(null);
+  const pulseRingRef = useRef(null);
+  const animFrameIdRef = useRef(null);
+  const texturesCacheRef = useRef({});
 
-  const isDragging = useRef(false);
-  const dragStart = useRef({ x: 0, y: 0 });
-  const startAngles = useRef({ rot: 0, tilt: 0 });
-  const pinchDist = useRef(null);
-  const targetRotationRef = useRef(null);
+  // Interaction & camera targets
+  const isDraggingRef = useRef(false);
+  const previousPointerRef = useRef({ x: 0, y: 0 });
+  const pointerDownPosRef = useRef({ x: 0, y: 0 });
+  const rotationTargetRef = useRef({ x: 0.14, y: 0.9 });
+  const cameraDistanceTargetRef = useRef(2.75);
+  const flyToTargetRef = useRef(null);
 
-  const matrix = getMatrix(dataset, frameIndex);
-  const kind = kindOf(dataset?.id);
-  const w = dataset?.width || 64;
-  const h = dataset?.height || 32;
+  const [zoomLevel, setZoomLevel] = useState(1.0);
 
-  // Fly-to animation when focusCoords changes (e.g. from location search)
+  // Determine dataset key: 'night_lights', 'ocean', or 'vegetation'
+  const datasetKey = useMemo(() => {
+    const group = dataset?.comparison_group?.toLowerCase() || '';
+    const id = dataset?.id?.toLowerCase() || '';
+    const title = dataset?.title?.toLowerCase() || '';
+
+    if (group.includes('ocean') || id.includes('ocean') || id.includes('sea') || title.includes('sea') || title.includes('ocean')) {
+      return 'ocean';
+    }
+    if (group.includes('veg') || id.includes('veg') || title.includes('veg')) {
+      return 'vegetation';
+    }
+    return 'night_lights';
+  }, [dataset]);
+
+  // Helper to load or retrieve cached texture
+  const getTexture = useCallback((key) => {
+    if (texturesCacheRef.current[key]) {
+      return texturesCacheRef.current[key];
+    }
+    const loader = new THREE.TextureLoader();
+    const url = key === 'ocean'
+      ? '/assets/earth_ocean_1024.jpg'
+      : key === 'vegetation'
+        ? '/assets/earth_veg_1024.jpg'
+        : '/assets/earth_night_1024.jpg';
+
+    const tex = loader.load(url);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.generateMipmaps = true;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    texturesCacheRef.current[key] = tex;
+    return tex;
+  }, []);
+
+  // ── 1. Setup Three.js WebGL Scene ──
   useEffect(() => {
-    if (!focusCoords || isGlobalView) return;
-    const { lon } = focusCoords;
-    // Calculate target Y-axis rotation to face the viewer
-    // In our polar coordinates, lon = 0 is centered when rotation = 0
-    let target = -(lon * (Math.PI / 180));
-    // Normalize target angle within [-PI, PI] relative to current rotation
-    const diff = ((target - rotation + Math.PI) % (Math.PI * 2)) - Math.PI;
-    targetRotationRef.current = rotation + diff;
-  }, [focusCoords, isGlobalView]);
+    if (isGlobalView) return;
+    const container = threeMountRef.current;
+    if (!container) return;
 
-  // Smooth rotation animation loop (idle spin + fly-to lerp)
-  useEffect(() => {
-    if (isGlobalView) return undefined;
-    let lastTime = performance.now();
+    const width = container.clientWidth || 520;
+    const height = container.clientHeight || 380;
 
-    const loop = (now) => {
-      const dt = Math.min((now - lastTime) / 1000, 0.1);
-      lastTime = now;
-      pulseRef.current = (pulseRef.current + dt * 2.5) % (Math.PI * 2);
+    // 1. Scene & Camera
+    const scene = new THREE.Scene();
+    sceneRef.current = scene;
 
-      if (targetRotationRef.current !== null) {
-        // Smooth lerp to target coordinate
-        setRotation((current) => {
-          const delta = targetRotationRef.current - current;
-          if (Math.abs(delta) < 0.005) {
-            const finalVal = targetRotationRef.current;
-            targetRotationRef.current = null;
-            return finalVal;
-          }
-          return current + delta * 0.14;
-        });
-      } else if (!isDragging.current) {
-        // Slow ambient rotation
-        setRotation((prev) => (prev + dt * 0.08) % (Math.PI * 2));
+    const camera = new THREE.PerspectiveCamera(40, width / height, 0.1, 100);
+    camera.position.set(0, 0, cameraDistanceTargetRef.current);
+    cameraRef.current = camera;
+
+    // 2. WebGL Renderer
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: true,
+      powerPreference: 'high-performance'
+    });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.15;
+    container.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
+
+    // 3. Main Earth Group (sphere + markers)
+    const earthGroup = new THREE.Group();
+    earthGroup.rotation.x = rotationTargetRef.current.x;
+    earthGroup.rotation.y = rotationTargetRef.current.y;
+    scene.add(earthGroup);
+    earthGroupRef.current = earthGroup;
+
+    // 4. Smooth Realistic Earth Sphere (No spikes)
+    const initialTex = getTexture(datasetKey);
+    const earthGeo = new THREE.SphereGeometry(1.0, 64, 64);
+    const earthMat = new THREE.MeshStandardMaterial({
+      map: initialTex,
+      roughness: datasetKey === 'ocean' ? 0.35 : datasetKey === 'vegetation' ? 0.75 : 0.65,
+      metalness: datasetKey === 'ocean' ? 0.15 : 0.05
+    });
+
+    if (datasetKey === 'night_lights') {
+      earthMat.emissiveMap = initialTex;
+      earthMat.emissive = new THREE.Color(0xFFE890);
+      earthMat.emissiveIntensity = 0.55;
+    }
+
+    const earthMesh = new THREE.Mesh(earthGeo, earthMat);
+    earthGroup.add(earthMesh);
+    earthMeshRef.current = earthMesh;
+
+    // 5. Atmospheric Rayleigh Scattering Halo
+    const atmoGeo = new THREE.SphereGeometry(1.032, 64, 64);
+    const atmoMat = new THREE.ShaderMaterial({
+      vertexShader: AtmosphereShader.vertexShader,
+      fragmentShader: AtmosphereShader.fragmentShader,
+      blending: THREE.AdditiveBlending,
+      side: THREE.BackSide,
+      transparent: true,
+      depthWrite: false
+    });
+    const atmoMesh = new THREE.Mesh(atmoGeo, atmoMat);
+    earthGroup.add(atmoMesh);
+
+    // 6. Selected Location Reticle & Beacon Marker Group
+    const pinGroup = new THREE.Group();
+    pinGroup.visible = false;
+
+    // Center illuminated beacon bead
+    const pinDot = new THREE.Mesh(
+      new THREE.SphereGeometry(0.016, 16, 16),
+      new THREE.MeshBasicMaterial({ color: 0x38D9F6 })
+    );
+    pinGroup.add(pinDot);
+
+    // Surface targeting reticle ring (flush with planet surface)
+    const ringGeo = new THREE.RingGeometry(0.024, 0.035, 32);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0x38D9F6,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.9
+    });
+    const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+    ringMesh.rotation.x = Math.PI / 2;
+    pinGroup.add(ringMesh);
+
+    // Pulsing outer radar ring
+    const pulseGeo = new THREE.RingGeometry(0.042, 0.052, 32);
+    const pulseMat = new THREE.MeshBasicMaterial({
+      color: 0x7DF9FF,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.65
+    });
+    const pulseRing = new THREE.Mesh(pulseGeo, pulseMat);
+    pulseRing.rotation.x = Math.PI / 2;
+    pinGroup.add(pulseRing);
+    pulseRingRef.current = pulseRing;
+
+    // Subtle perpendicular pinpoint stem
+    const stemPoints = [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0.06, 0)];
+    const stemGeo = new THREE.BufferGeometry().setFromPoints(stemPoints);
+    const stemMat = new THREE.LineBasicMaterial({ color: 0x38D9F6, transparent: true, opacity: 0.7 });
+    const stemLine = new THREE.Line(stemGeo, stemMat);
+    pinGroup.add(stemLine);
+
+    earthGroup.add(pinGroup);
+    selectedPinGroupRef.current = pinGroup;
+
+    // 7. Lighting
+    const sunLight = new THREE.DirectionalLight(0xFFFFFF, 2.4);
+    sunLight.position.set(5, 3, 4);
+    scene.add(sunLight);
+
+    const ambientLight = new THREE.AmbientLight(0x0C182B, 0.6);
+    scene.add(ambientLight);
+
+    const rimLight = new THREE.DirectionalLight(0x38D9E6, 0.9);
+    rimLight.position.set(-5, -2, -3);
+    scene.add(rimLight);
+
+    // 8. Animation Loop
+    let pulseT = 0;
+    const animate = () => {
+      pulseT += 0.045;
+
+      // Smooth camera distance interpolation
+      camera.position.z += (cameraDistanceTargetRef.current - camera.position.z) * 0.1;
+
+      // Smooth rotation interpolation
+      if (flyToTargetRef.current) {
+        const dy = flyToTargetRef.current.y - earthGroup.rotation.y;
+        const dx = flyToTargetRef.current.x - earthGroup.rotation.x;
+        earthGroup.rotation.y += dy * 0.1;
+        earthGroup.rotation.x += dx * 0.1;
+        if (Math.abs(dy) < 0.002 && Math.abs(dx) < 0.002) {
+          flyToTargetRef.current = null;
+        }
+      } else if (!isDraggingRef.current) {
+        // Subtle ambient continuous spin
+        rotationTargetRef.current.y += 0.0012;
+        earthGroup.rotation.y += (rotationTargetRef.current.y - earthGroup.rotation.y) * 0.08;
+        earthGroup.rotation.x += (rotationTargetRef.current.x - earthGroup.rotation.x) * 0.08;
+      } else {
+        earthGroup.rotation.y += (rotationTargetRef.current.y - earthGroup.rotation.y) * 0.18;
+        earthGroup.rotation.x += (rotationTargetRef.current.x - earthGroup.rotation.x) * 0.18;
       }
 
-      animRef.current = requestAnimationFrame(loop);
+      // Selected Reticle Pulse Animation
+      if (pulseRingRef.current) {
+        const pScale = 1.0 + Math.sin(pulseT * 2.8) * 0.25;
+        pulseRingRef.current.scale.set(pScale, pScale, pScale);
+        pulseRingRef.current.material.opacity = 0.4 + Math.sin(pulseT * 2.8) * 0.35;
+      }
+
+      renderer.render(scene, camera);
+      animFrameIdRef.current = requestAnimationFrame(animate);
     };
 
-    animRef.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animRef.current);
-  }, [isGlobalView]);
+    animate();
 
-  // ── Render Globe (3D Orthographic or 2D Equirectangular) ──
+    // 9. Resize handler
+    const handleResize = () => {
+      if (!container) return;
+      const w = container.clientWidth || 520;
+      const h = container.clientHeight || 380;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    };
+
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (animFrameIdRef.current) cancelAnimationFrame(animFrameIdRef.current);
+      if (renderer.domElement && container.contains(renderer.domElement)) {
+        container.removeChild(renderer.domElement);
+      }
+      renderer.dispose();
+    };
+  }, [isGlobalView, getTexture, datasetKey]);
+
+  // ── 2. Update Earth Texture when Dataset Changes ──
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !matrix) return;
+    if (!earthMeshRef.current) return;
+    const mat = earthMeshRef.current.material;
+    const tex = getTexture(datasetKey);
+
+    mat.map = tex;
+    if (datasetKey === 'night_lights') {
+      mat.emissiveMap = tex;
+      mat.emissive = new THREE.Color(0xFFE890);
+      mat.emissiveIntensity = 0.55;
+      mat.roughness = 0.65;
+      mat.metalness = 0.05;
+    } else if (datasetKey === 'ocean') {
+      mat.emissiveMap = null;
+      mat.emissive = new THREE.Color(0x000000);
+      mat.emissiveIntensity = 0;
+      mat.roughness = 0.35;
+      mat.metalness = 0.15;
+    } else {
+      // vegetation
+      mat.emissiveMap = null;
+      mat.emissive = new THREE.Color(0x000000);
+      mat.emissiveIntensity = 0;
+      mat.roughness = 0.75;
+      mat.metalness = 0.02;
+    }
+    mat.needsUpdate = true;
+  }, [datasetKey, getTexture]);
+
+  // ── 3. Update Selected Location Reticle Position on Sphere Surface ──
+  useEffect(() => {
+    if (!selectedPinGroupRef.current) return;
+    if (!selectedLocation) {
+      selectedPinGroupRef.current.visible = false;
+      return;
+    }
+
+    const pos = latLonToVector3(selectedLocation.lat, selectedLocation.lon, 1.002);
+    selectedPinGroupRef.current.position.copy(pos);
+    selectedPinGroupRef.current.quaternion.setFromUnitVectors(
+      new THREE.Vector3(0, 1, 0),
+      pos.clone().normalize()
+    );
+    selectedPinGroupRef.current.visible = true;
+  }, [selectedLocation]);
+
+  // ── 4. Smooth Fly-to Animation when search focusCoords changes ──
+  useEffect(() => {
+    if (!focusCoords || !earthGroupRef.current) return;
+    const { lat, lon } = focusCoords;
+    const targetY = -(lon * (Math.PI / 180)) - Math.PI / 2;
+    const targetX = (lat * (Math.PI / 180)) * 0.4;
+    flyToTargetRef.current = { x: targetX, y: targetY };
+    rotationTargetRef.current = { x: targetX, y: targetY };
+  }, [focusCoords]);
+
+  // ── 5. Mouse & Touch Drag Rotation ──
+  const handlePointerDown = (e) => {
+    isDraggingRef.current = true;
+    previousPointerRef.current = { x: e.clientX, y: e.clientY };
+    pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
+    flyToTargetRef.current = null;
+  };
+
+  const handlePointerMove = (e) => {
+    if (!isDraggingRef.current) return;
+    const dx = e.clientX - previousPointerRef.current.x;
+    const dy = e.clientY - previousPointerRef.current.y;
+    previousPointerRef.current = { x: e.clientX, y: e.clientY };
+
+    rotationTargetRef.current.y += dx * 0.006;
+    rotationTargetRef.current.x = clamp(
+      rotationTargetRef.current.x + dy * 0.006,
+      -0.85,
+      0.85
+    );
+  };
+
+  const handlePointerUp = (e) => {
+    isDraggingRef.current = false;
+  };
+
+  // ── 6. Wheel Zoom ──
+  const handleWheel = (e) => {
+    e.preventDefault();
+    const zoomDelta = e.deltaY * 0.002;
+    const newTarget = clamp(cameraDistanceTargetRef.current + zoomDelta, 1.8, 4.2);
+    cameraDistanceTargetRef.current = newTarget;
+    setZoomLevel(Number(((4.2 - newTarget) / (4.2 - 1.8) + 0.6).toFixed(1)));
+  };
+
+  // ── 7. Click Raycasting: Select Geographic Coordinate on Globe ──
+  const handleClick = (e) => {
+    if (isGlobalView) return;
+    // Don't treat a drag release as a click
+    const distSq =
+      Math.pow(e.clientX - pointerDownPosRef.current.x, 2) +
+      Math.pow(e.clientY - pointerDownPosRef.current.y, 2);
+    if (distSq > 25) return;
+
+    const container = threeMountRef.current;
+    if (!container || !cameraRef.current || !earthMeshRef.current || !earthGroupRef.current) return;
+
+    const rect = container.getBoundingClientRect();
+    const mouse = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1
+    );
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(mouse, cameraRef.current);
+
+    const intersects = raycaster.intersectObject(earthMeshRef.current);
+    if (intersects.length > 0) {
+      const hitPoint = intersects[0].point;
+      const localPoint = earthGroupRef.current.worldToLocal(hitPoint.clone());
+      const { lat, lon } = vector3ToLatLon(localPoint);
+      const location = findNearestLocation(lat, lon);
+      if (onSelectLocation) {
+        onSelectLocation(location);
+      }
+    }
+  };
+
+  // Zoom Button Handlers
+  const handleZoomIn = () => {
+    cameraDistanceTargetRef.current = Math.max(1.8, cameraDistanceTargetRef.current - 0.4);
+  };
+  const handleZoomOut = () => {
+    cameraDistanceTargetRef.current = Math.min(4.2, cameraDistanceTargetRef.current + 0.4);
+  };
+  const handleResetView = () => {
+    cameraDistanceTargetRef.current = 2.75;
+    rotationTargetRef.current = { x: 0.14, y: 0.9 };
+    flyToTargetRef.current = null;
+  };
+
+  // ── 8. Render 2D Normal Map when isGlobalView === true ──
+  useEffect(() => {
+    if (!isGlobalView) return;
+    const canvas = canvas2dRef.current;
+    if (!canvas) return;
     const ctx = canvas.getContext('2d');
     const width = canvas.width;
     const height = canvas.height;
 
-    ctx.clearRect(0, 0, width, height);
+    const img = new Image();
+    const texUrl = datasetKey === 'ocean'
+      ? '/assets/earth_ocean_1024.jpg'
+      : datasetKey === 'vegetation'
+        ? '/assets/earth_veg_1024.jpg'
+        : '/assets/earth_night_1024.jpg';
 
-    if (isGlobalView) {
-      // ══════════════════════════════════════════════════════════
-      // 2D EQUIRRECTANGULAR SCIENTIFIC MAP
-      // ══════════════════════════════════════════════════════════
-      const cw = width / w;
-      const ch = height / h;
+    img.onload = () => {
+      ctx.clearRect(0, 0, width, height);
+      // Draw smooth equirectangular map
+      ctx.drawImage(img, 0, 0, width, height);
 
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          const val = matrix[y]?.[x];
-          if (val === null || val === undefined) {
-            ctx.fillStyle = '#050914';
-          } else {
-            const t = clamp(val, 0, 1);
-            if (kind === 'ocean') {
-              ctx.fillStyle = `rgb(${(15 + t * 50) | 0}, ${(40 + t * 180) | 0}, ${(100 + t * 155) | 0})`;
-            } else if (kind === 'veg') {
-              ctx.fillStyle = `rgb(${(15 + (1 - t) * 60) | 0}, ${(45 + t * 180) | 0}, ${(25 + t * 80) | 0})`;
-            } else {
-              ctx.fillStyle = `rgb(${(t * 255) | 0}, ${(t * 215) | 0}, ${(t * 120) | 0})`;
-            }
-          }
-          ctx.fillRect(x * cw, y * ch, Math.ceil(cw), Math.ceil(ch));
-        }
-      }
-
-      // Lat/Lon gridlines
-      ctx.strokeStyle = 'rgba(56, 217, 230, 0.15)';
+      // Subtle scientific latitude & longitude grid
       ctx.lineWidth = 1;
-      ctx.strokeRect(0, 0, width, height);
 
-      // Equator & Prime Meridian
+      // Equator
+      ctx.strokeStyle = 'rgba(56, 217, 230, 0.35)';
       ctx.beginPath();
       ctx.moveTo(0, height / 2);
       ctx.lineTo(width, height / 2);
+      ctx.stroke();
+
+      // Prime Meridian
+      ctx.beginPath();
       ctx.moveTo(width / 2, 0);
       ctx.lineTo(width / 2, height);
       ctx.stroke();
 
-      // Draw Selected Location Pin in 2D
+      // Latitude lines: 30N, 60N, 30S, 60S
+      [30, 60, -30, -60].forEach((lat) => {
+        const y = ((90 - lat) / 180) * height;
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+      });
+
+      // Longitude lines: -120, -60, +60, +120
+      [-120, -60, 60, 120].forEach((lon) => {
+        const x = ((lon + 180) / 360) * width;
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+      });
+
+      // Selected Location Marker in 2D
       if (selectedLocation) {
         const pinX = ((selectedLocation.lon + 180) / 360) * width;
         const pinY = ((90 - selectedLocation.lat) / 180) * height;
 
-        // Outer pulsing ring
-        const pulse = Math.sin(pulseRef.current) * 4 + 8;
+        // Outer reticle circle
         ctx.strokeStyle = '#38D9E6';
-        ctx.lineWidth = 1.5;
+        ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.arc(pinX, pinY, pulse, 0, Math.PI * 2);
+        ctx.arc(pinX, pinY, 9, 0, Math.PI * 2);
         ctx.stroke();
 
-        // Pin center dot
-        ctx.fillStyle = '#38D9E6';
+        // Crosshairs
+        ctx.strokeStyle = 'rgba(56, 217, 230, 0.7)';
+        ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.arc(pinX, pinY, 4, 0, Math.PI * 2);
+        ctx.moveTo(pinX - 14, pinY);
+        ctx.lineTo(pinX + 14, pinY);
+        ctx.moveTo(pinX, pinY - 14);
+        ctx.lineTo(pinX, pinY + 14);
+        ctx.stroke();
+
+        // Center beacon dot
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath();
+        ctx.arc(pinX, pinY, 3.5, 0, Math.PI * 2);
         ctx.fill();
 
-        // Text label
+        // Location text badge
+        const label = selectedLocation.name || 'Selected';
         ctx.font = '600 11px Inter, sans-serif';
-        ctx.fillStyle = '#F8FAFC';
-        ctx.fillText(selectedLocation.name || 'Selected', pinX + 8, pinY - 6);
+        const textWidth = ctx.measureText(label).width;
+        ctx.fillStyle = 'rgba(6, 11, 24, 0.88)';
+        ctx.fillRect(pinX + 10, pinY - 18, textWidth + 14, 20);
+        ctx.strokeStyle = 'rgba(56, 217, 230, 0.45)';
+        ctx.strokeRect(pinX + 10, pinY - 18, textWidth + 14, 20);
+        ctx.fillStyle = '#38D9E6';
+        ctx.fillText(label, pinX + 16, pinY - 4);
       }
+    };
+    img.src = texUrl;
+  }, [isGlobalView, datasetKey, selectedLocation]);
 
-    } else {
-      // ══════════════════════════════════════════════════════════
-      // 3D ORTHOGRAPHIC PHOTOREALISTIC EARTH GLOBE
-      // ══════════════════════════════════════════════════════════
-      const cx = width / 2;
-      const cy = height / 2;
-      const baseRadius = Math.min(width, height) * 0.44;
-      const radius = baseRadius * zoom;
-
-      // 1. Atmospheric Outer Glow
-      const atmoGrad = ctx.createRadialGradient(cx, cy, radius * 0.96, cx, cy, radius * 1.25);
-      atmoGrad.addColorStop(0, 'rgba(56, 217, 230, 0.32)');
-      atmoGrad.addColorStop(0.35, 'rgba(96, 165, 250, 0.14)');
-      atmoGrad.addColorStop(1, 'transparent');
-      ctx.fillStyle = atmoGrad;
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius * 1.25, 0, Math.PI * 2);
-      ctx.fill();
-
-      // 2. Base Celestial Globe
-      const sphereBg = ctx.createRadialGradient(
-        cx - radius * 0.3,
-        cy - radius * 0.3,
-        radius * 0.1,
-        cx,
-        cy,
-        radius
-      );
-      sphereBg.addColorStop(0, '#0D172A');
-      sphereBg.addColorStop(0.7, '#070D1B');
-      sphereBg.addColorStop(1, '#03060C');
-      ctx.fillStyle = sphereBg;
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-      ctx.fill();
-
-      // 3. Project Dataset Grid onto 3D Sphere Surface
-      // Sampling step scales dynamically with zoom for sharp rendering
-      const step = Math.max(2.0, 3.0 / zoom);
-      const cosT = Math.cos(tilt);
-      const sinT = Math.sin(tilt);
-      const cosR = Math.cos(rotation);
-      const sinR = Math.sin(rotation);
-
-      for (let py = -radius; py <= radius; py += step) {
-        const yNorm = -py / radius;
-        if (Math.abs(yNorm) >= 1) continue;
-        const xSpan = Math.sqrt(1 - yNorm * yNorm);
-
-        for (let px = -xSpan * radius; px <= xSpan * radius; px += step) {
-          const xNorm = px / radius;
-          const zSq = 1 - xNorm * xNorm - yNorm * yNorm;
-          if (zSq <= 0) continue;
-          const zNorm = Math.sqrt(zSq);
-
-          // Invert pitch tilt (X-axis)
-          const y1 = yNorm * cosT + zNorm * sinT;
-          const z1 = -yNorm * sinT + zNorm * cosT;
-          const x1 = xNorm;
-
-          // Invert azimuth rotation (Y-axis)
-          const X = x1 * cosR - z1 * sinR;
-          const Z = x1 * sinR + z1 * cosR;
-          const Y = y1;
-
-          // Sphere Polar Coordinates
-          const lat = Math.asin(clamp(Y, -1, 1));
-          const lon = Math.atan2(X, Z);
-
-          const gridY = clamp(Math.floor((1 - (lat / Math.PI + 0.5)) * h), 0, h - 1);
-          const gridX = clamp(Math.floor(((lon / Math.PI + 1) * 0.5) * w), 0, w - 1);
-
-          const val = matrix[gridY]?.[gridX];
-          if (val === null || val === undefined) continue;
-
-          const t = clamp(val, 0, 1);
-          if (t <= 0.015) continue;
-
-          // 3D Limb darkening factor for depth curvature
-          const limb = Math.pow(zNorm, 0.65);
-
-          let r, g, b, alpha;
-          if (kind === 'ocean') {
-            r = (15 + t * 50);
-            g = (40 + t * 180);
-            b = (120 + t * 135);
-            alpha = (0.25 + t * 0.75) * limb;
-          } else if (kind === 'veg') {
-            r = (15 + (1 - t) * 50);
-            g = (40 + t * 190);
-            b = (25 + t * 80);
-            alpha = (0.3 + t * 0.7) * limb;
-          } else {
-            // Golden-amber city lights with white core
-            r = (t * 255);
-            g = (t * 220);
-            b = (t * 130);
-            alpha = (0.35 + t * 0.65) * (0.85 + 0.15 * limb);
-          }
-
-          ctx.fillStyle = `rgba(${r | 0}, ${g | 0}, ${b | 0}, ${alpha})`;
-          ctx.fillRect(cx + px - step / 2, cy + py - step / 2, step * 1.35, step * 1.35);
-        }
-      }
-
-      // 4. Atmospheric Rim Shading Overlay
-      const limbGrad = ctx.createRadialGradient(cx, cy, radius * 0.72, cx, cy, radius);
-      limbGrad.addColorStop(0, 'rgba(0, 0, 0, 0)');
-      limbGrad.addColorStop(0.85, 'rgba(7, 13, 27, 0.45)');
-      limbGrad.addColorStop(1, 'rgba(56, 217, 230, 0.4)');
-      ctx.fillStyle = limbGrad;
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Outer crisp atmospheric rim line
-      ctx.strokeStyle = 'rgba(56, 217, 230, 0.45)';
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-      ctx.stroke();
-
-      // 5. Draw 3D Selection Pin Marker (Pinned to Globe Surface)
-      if (selectedLocation) {
-        const latRad = selectedLocation.lat * (Math.PI / 180);
-        const lonRad = selectedLocation.lon * (Math.PI / 180);
-
-        // Unit sphere coordinates
-        const Y = Math.sin(latRad);
-        const cosLat = Math.cos(latRad);
-        const X = cosLat * Math.sin(lonRad);
-        const Z = cosLat * Math.cos(lonRad);
-
-        // Rotate by Y-axis azimuth (rotation)
-        const x1 = X * cosR + Z * sinR;
-        const y1 = Y;
-        const z1 = -X * sinR + Z * cosR;
-
-        // Rotate by X-axis tilt
-        const xScreen = x1;
-        const yScreen = y1 * cosT - z1 * sinT;
-        const zScreen = y1 * sinT + z1 * cosT;
-
-        // Only draw pin if on the visible hemisphere facing the camera
-        if (zScreen > 0) {
-          const pinX = cx + xScreen * radius;
-          const pinY = cy - yScreen * radius;
-
-          // Animated sonar pulse ring
-          const pulse = (Math.sin(pulseRef.current) * 0.5 + 0.5) * 10 + 6;
-          ctx.strokeStyle = 'rgba(56, 217, 230, 0.85)';
-          ctx.lineWidth = 1.6;
-          ctx.beginPath();
-          ctx.arc(pinX, pinY, pulse, 0, Math.PI * 2);
-          ctx.stroke();
-
-          // Anchor core dot
-          ctx.fillStyle = '#38D9E6';
-          ctx.shadowColor = '#38D9E6';
-          ctx.shadowBlur = 10;
-          ctx.beginPath();
-          ctx.arc(pinX, pinY, 4, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.shadowBlur = 0; // reset
-
-          // Vertical pin stem line
-          const stemHeight = 22;
-          ctx.strokeStyle = '#38D9E6';
-          ctx.lineWidth = 1.5;
-          ctx.beginPath();
-          ctx.moveTo(pinX, pinY);
-          ctx.lineTo(pinX, pinY - stemHeight);
-          ctx.stroke();
-
-          // Floating Location Badge Pill
-          const label = selectedLocation.name || 'Selected Point';
-          ctx.font = '700 11px Inter, sans-serif';
-          const textMetrics = ctx.measureText(label);
-          const badgeW = textMetrics.width + 16;
-          const badgeH = 20;
-          const badgeX = pinX - badgeW / 2;
-          const badgeY = pinY - stemHeight - badgeH;
-
-          // Badge background
-          ctx.fillStyle = 'rgba(11, 19, 36, 0.9)';
-          ctx.strokeStyle = '#38D9E6';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          if (ctx.roundRect) {
-            ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 6);
-          } else {
-            ctx.rect(badgeX, badgeY, badgeW, badgeH);
-          }
-          ctx.fill();
-          ctx.stroke();
-
-          // Badge text
-          ctx.fillStyle = '#F8FAFC';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(label, pinX, badgeY + badgeH / 2);
-          ctx.textAlign = 'start'; // reset
-          ctx.textBaseline = 'alphabetic'; // reset
-        }
-      }
-    }
-  }, [matrix, rotation, tilt, zoom, isGlobalView, kind, w, h, selectedLocation]);
-
-  // ── Mouse & Touch Gesture Handlers ──
-  const handlePointerDown = (e) => {
-    isDragging.current = true;
-    dragStart.current = { x: e.clientX, y: e.clientY };
-    startAngles.current = { rot: rotation, tilt };
-    targetRotationRef.current = null; // stop any programmatic fly-to
-    canvasRef.current?.setPointerCapture?.(e.pointerId);
-  };
-
-  const handlePointerMove = (e) => {
-    if (!isDragging.current) return;
-    const dx = e.clientX - dragStart.current.x;
-    const dy = e.clientY - dragStart.current.y;
-
-    if (isGlobalView) return;
-
-    // Y-axis rotation (drag horizontally)
-    setRotation(startAngles.current.rot + dx / (130 * zoom));
-    // X-axis tilt (drag vertically, clamped)
-    const newTilt = startAngles.current.tilt + dy / (180 * zoom);
-    setTilt(clamp(newTilt, -0.75, 0.75));
-  };
-
-  const handlePointerUp = () => {
-    isDragging.current = false;
-  };
-
-  // Wheel Zoom (Mouse & Trackpad)
-  const handleWheel = (e) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.08 : 0.92;
-    setZoom((prev) => clamp(prev * zoomFactor, 0.75, 2.8));
-  };
-
-  // Touch Pinch-to-Zoom for mobile
-  const handleTouchMove = (e) => {
-    if (e.touches.length === 2) {
-      const touch1 = e.touches[0];
-      const touch2 = e.touches[1];
-      const dist = Math.hypot(touch1.clientX - touch2.clientX, touch1.clientY - touch2.clientY);
-      if (pinchDist.current !== null) {
-        const delta = dist / pinchDist.current;
-        setZoom((prev) => clamp(prev * delta, 0.75, 2.8));
-      }
-      pinchDist.current = dist;
-    }
-  };
-
-  const handleTouchEnd = () => {
-    pinchDist.current = null;
-  };
-
-  // Click on Earth: Raycast & Select Geographical Location
-  const handleCanvasClick = (e) => {
-    if (isDragging.current) return;
-    const canvas = canvasRef.current;
-    if (!canvas || !onSelectLocation) return;
-
+  // Click handler for 2D Map Canvas
+  const handleCanvas2DClick = (e) => {
+    const canvas = canvas2dRef.current;
+    if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const clickY = e.clientY - rect.top;
 
-    if (isGlobalView) {
-      // 2D Equirectangular map click
-      const lon = -180 + (clickX / rect.width) * 360;
-      const lat = 90 - (clickY / rect.height) * 180;
-      onSelectLocation({ lat: clamp(lat, -90, 90), lon: clamp(lon, -180, 180) });
-      return;
-    }
-
-    // 3D Sphere Raycast
-    const cx = rect.width / 2;
-    const cy = rect.height / 2;
-    const baseRadius = Math.min(rect.width, rect.height) * 0.44;
-    const radius = baseRadius * zoom;
-
-    const px = clickX - cx;
-    const py = clickY - cy;
-    const dSq = px * px + py * py;
-
-    // Check if clicked inside the sphere circle
-    if (dSq <= radius * radius) {
-      const xNorm = px / radius;
-      const yNorm = -py / radius;
-      const zNorm = Math.sqrt(1 - xNorm * xNorm - yNorm * yNorm);
-
-      const cosT = Math.cos(tilt);
-      const sinT = Math.sin(tilt);
-      const cosR = Math.cos(rotation);
-      const sinR = Math.sin(rotation);
-
-      // Invert tilt around X-axis
-      const y1 = yNorm * cosT + zNorm * sinT;
-      const z1 = -yNorm * sinT + zNorm * cosT;
-      const x1 = xNorm;
-
-      // Invert azimuth around Y-axis
-      const X = x1 * cosR - z1 * sinR;
-      const Z = x1 * sinR + z1 * cosR;
-      const Y = y1;
-
-      const lat = Math.asin(clamp(Y, -1, 1)) * (180 / Math.PI);
-      const lon = Math.atan2(X, Z) * (180 / Math.PI);
-
-      onSelectLocation({ lat: clamp(lat, -90, 90), lon: clamp(lon, -180, 180) });
+    const lon = (clickX / rect.width) * 360 - 180;
+    const lat = 90 - (clickY / rect.height) * 180;
+    const loc = findNearestLocation(lat, lon);
+    if (onSelectLocation) {
+      onSelectLocation(loc);
     }
   };
-
-  // Zoom control buttons
-  const handleZoomIn = () => setZoom((prev) => clamp(prev * 1.25, 0.75, 2.8));
-  const handleZoomOut = () => setZoom((prev) => clamp(prev * 0.8, 0.75, 2.8));
-  const handleResetView = () => {
-    setZoom(1.0);
-    setTilt(0.12);
-    setRotation(0.8);
-    targetRotationRef.current = null;
-  };
-
-  const displayDatasetName = dataset?.name ||
-    (dataset?.title?.includes('Night Lights') ? 'Night Lights' :
-     dataset?.title?.includes('Sea Surface') ? 'Ocean' :
-     dataset?.title?.includes('Vegetation') ? 'Vegetation' :
-     dataset?.title?.replace(/\s*\(.*?\)/, '') || 'Night Lights');
 
   const currentEpochYear = dataset?.frames?.[frameIndex]?.label ||
     dataset?.frames?.[frameIndex]?.timestamp?.match(/\d{4}/)?.[0] ||
     dataset?.observation_date?.match(/\d{4}/)?.[0] ||
     '2023';
 
+  const displayDatasetName = datasetKey === 'night_lights' ? 'Night Lights' :
+    datasetKey === 'ocean' ? 'Ocean' :
+    datasetKey === 'vegetation' ? 'Vegetation' :
+    dataset?.title || 'Night Lights';
+
   return (
     <div className="earth-viewport-container">
+      {/* Header with Title & View Toggle */}
       <div className="viewport-header">
         <h3 className="viewport-title">EARTH OBSERVATION</h3>
         <div className="viewport-header-actions">
@@ -519,26 +586,30 @@ export default function EarthGlobe({
         </div>
       </div>
 
+      {/* Main Viewport Stage */}
       <div
         className="viewport-stage"
         onWheel={handleWheel}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onClick={handleClick}
       >
-        <canvas
-          ref={canvasRef}
-          width={520}
-          height={380}
-          className="earth-canvas"
-          onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp}
-          onPointerCancel={handlePointerUp}
-          onClick={handleCanvasClick}
-          title={isGlobalView ? 'Click any point on the map to inspect' : 'Click to select location · Drag to rotate · Scroll to zoom'}
-        />
+        {isGlobalView ? (
+          <canvas
+            ref={canvas2dRef}
+            width={520}
+            height={380}
+            className="earth-canvas"
+            onClick={handleCanvas2DClick}
+            title="Click anywhere to inspect coordinates on 2D map"
+          />
+        ) : (
+          <div ref={threeMountRef} className="three-globe-mount" />
+        )}
 
-        {/* Floating Zoom and Viewport Controls */}
+        {/* Floating View & Zoom Controls */}
         <div className="floating-globe-controls" aria-label="Globe navigation controls">
           <button
             type="button"
@@ -579,6 +650,7 @@ export default function EarthGlobe({
         )}
       </div>
 
+      {/* Footer with Dataset Label & Year */}
       <div className="viewport-footer">
         <span className="footer-dataset-label">
           Dataset: {displayDatasetName}

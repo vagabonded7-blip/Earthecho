@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import Jukebox from './components/Jukebox.jsx';
+import CinematicLanding from './components/CinematicLanding.jsx';
 import { loadDataset, loadManifest } from './data/loader.js';
 import { mockNightLights2012, mockNightLights2023 } from './data/mockData.js';
 
@@ -19,6 +20,16 @@ export default function App() {
   const [dataStatus, setDataStatus] = useState('loading');
   const [manifestRetry, setManifestRetry] = useState(0);
   const [dataRetry, setDataRetry] = useState(0);
+
+  // Landing sequence stage: 'landing' (first entry) | 'transitioning' | 'jukebox'
+  const [landingStage, setLandingStage] = useState(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      return params.get('skipIntro') === 'true' ? 'jukebox' : 'landing';
+    } catch {
+      return 'landing';
+    }
+  });
 
   const availableDatasets = useMemo(
     () => [
@@ -77,22 +88,45 @@ export default function App() {
     return () => controller.abort();
   }, [selectedEntry, dataRetry]);
 
+  const handleEnterJukebox = () => {
+    setLandingStage('transitioning');
+    setTimeout(() => {
+      setLandingStage('jukebox');
+    }, 1200);
+  };
+
+  const handleReplayIntro = () => {
+    setLandingStage('landing');
+  };
+
   return (
-    <Jukebox
-      datasets={availableDatasets}
-      selectedId={selectedId}
-      onSelect={(id) => {
-        setManifestError('');
-        setSelectedId(id);
-      }}
-      dataset={dataset}
-      dataStatus={dataStatus}
-      error={manifestError || dataError}
-      retryLabel={manifestError ? 'Retry loading available datasets' : 'Retry loading this dataset'}
-      onRetry={() => {
-        if (manifestError) setManifestRetry((count) => count + 1);
-        else setDataRetry((count) => count + 1);
-      }}
-    />
+    <div className="app-root-shell">
+      {landingStage !== 'jukebox' && (
+        <CinematicLanding
+          onEnter={handleEnterJukebox}
+          isTransitioning={landingStage === 'transitioning'}
+        />
+      )}
+
+      <div className={`jukebox-app-wrapper ${landingStage === 'jukebox' ? 'active' : ''}`}>
+        <Jukebox
+          datasets={availableDatasets}
+          selectedId={selectedId}
+          onSelect={(id) => {
+            setManifestError('');
+            setSelectedId(id);
+          }}
+          dataset={dataset}
+          dataStatus={dataStatus}
+          error={manifestError || dataError}
+          retryLabel={manifestError ? 'Retry loading available datasets' : 'Retry loading this dataset'}
+          onRetry={() => {
+            if (manifestError) setManifestRetry((count) => count + 1);
+            else setDataRetry((count) => count + 1);
+          }}
+          onReplayIntro={handleReplayIntro}
+        />
+      </div>
+    </div>
   );
 }
