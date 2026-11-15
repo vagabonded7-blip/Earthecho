@@ -222,3 +222,4 @@ export function searchLocations(query) {
     loc.region.toLowerCase().includes(trimmed)
   ).slice(0, 8);
 }
+

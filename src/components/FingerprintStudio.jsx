@@ -295,3 +295,4 @@ export default function FingerprintStudio({ dataset, frameIndex }) {
     </section>
   );
 }
+

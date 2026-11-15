@@ -39,3 +39,4 @@ export default function TimelineSelector({ dataset, frameIndex, onSelectFrame })
     </div>
   );
 }
+
